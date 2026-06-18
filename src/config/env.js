@@ -37,7 +37,7 @@ export const env = {
   port: parseInt(process.env.PORT || '5000', 10),
   nodeEnv: process.env.NODE_ENV || 'production',
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
-  
+
   // Anthropic and Domo MCP configurations
   anthropicApiKey: process.env.ANTHROPIC_API_KEY,
   domoMcpScriptPath: path.resolve(__dirname, '../mcp/domoMcpTool.js'),

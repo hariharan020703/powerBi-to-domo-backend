@@ -60,7 +60,7 @@ export function resolveRelationships(relationships) {
   return resolved;
 }
 
-async function fetchDomoDatasetSchema(domain, token, datasetId) {
+export async function fetchDomoDatasetSchema(domain, token, datasetId) {
   try {
     const headers = getAuthHeaders(token);
     const url = `https://${domain}/api/query/v1/datasources/${datasetId}/schema/indexed?includeHidden=false`;
@@ -71,7 +71,7 @@ async function fetchDomoDatasetSchema(domain, token, datasetId) {
     return columns;
   } catch (err) {
     console.error(`[DATA MODEL] Schema fetch FAILED for ${datasetId}: HTTP ${err.response?.status} - ${err.message}`);
-    return null;  // return null instead of [] so we can detect failure
+    return null;
   }
 }
 

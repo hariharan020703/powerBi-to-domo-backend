@@ -143,13 +143,13 @@ export async function uploadDataToDomoDataset(domoDatasetId, columns, rows) {
 
   const csvString = [header, ...dataLines].join('\n');
 
-  console.log('================================');
-  console.log('DATASET ID:', domoDatasetId);
-  console.log('ROWS COUNT:', rows.length);
-  console.log('CSV LENGTH:', csvString.length);
-  console.log('CSV PREVIEW:');
-  console.log(csvString.split('\n').slice(0, 5).join('\n'));
-  console.log('================================');
+  // console.log('================================');
+  // console.log('DATASET ID:', domoDatasetId);
+  // console.log('ROWS COUNT:', rows.length);
+  // console.log('CSV LENGTH:', csvString.length);
+  // console.log('CSV PREVIEW:');
+  // console.log(csvString.split('\n').slice(0, 5).join('\n'));
+  // console.log('================================');
 
   const authHeaders = { 'X-DOMO-DEVELOPER-TOKEN': token };
 
@@ -165,7 +165,7 @@ export async function uploadDataToDomoDataset(domoDatasetId, columns, rows) {
     if (!uploadId) {
       throw new Error(`No uploadId returned. Response: ${JSON.stringify(sessionRes.data)}`);
     }
-    console.log('UPLOAD SESSION ID:', uploadId);
+    // console.log('UPLOAD SESSION ID:', uploadId);
 
     // STEP 2: Upload CSV as a raw part (this is where the actual data goes)
     const partRes = await axios.put(
@@ -181,7 +181,7 @@ export async function uploadDataToDomoDataset(domoDatasetId, columns, rows) {
         maxContentLength: Infinity
       }
     );
-    console.log('PART UPLOAD STATUS:', partRes.status);
+    // console.log('PART UPLOAD STATUS:', partRes.status);
 
     // STEP 3: Commit the upload session
     const commitRes = await axios.put(
@@ -189,8 +189,8 @@ export async function uploadDataToDomoDataset(domoDatasetId, columns, rows) {
       { index: true },
       { headers: { ...authHeaders, 'Content-Type': 'application/json' }, timeout: 60000 }
     );
-    console.log('COMMIT STATUS:', commitRes.status);
-    console.log('COMMIT RESPONSE:', JSON.stringify(commitRes.data, null, 2));
+    // console.log('COMMIT STATUS:', commitRes.status);
+    // console.log('COMMIT RESPONSE:', JSON.stringify(commitRes.data, null, 2));
 
     // STEP 4: Verify
     await new Promise(resolve => setTimeout(resolve, 5000));
@@ -198,7 +198,7 @@ export async function uploadDataToDomoDataset(domoDatasetId, columns, rows) {
       `https://${domain}/api/data/v3/datasources/${domoDatasetId}`,
       { headers: authHeaders }
     );
-    console.log('VERIFIED ROW COUNT:', verify.data.rowCount);
+    // console.log('VERIFIED ROW COUNT:', verify.data.rowCount);
 
     return true;
 

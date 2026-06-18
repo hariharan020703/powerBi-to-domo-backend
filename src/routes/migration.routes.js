@@ -3,10 +3,12 @@ import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import axios from 'axios';
 import { env } from '../config/env.js';
-import { executeQuery, getDashboardTiles, getDatasetTables, getTableData, getDatasetRelationships, getDatasetColumns, getDatasetTableMeta } from '../services/powerbiService.js';
+import { executeQuery, getDashboardTiles, getDatasetTables, getTableData, getDatasetRelationships, getDatasetColumns, getDatasetTableMeta, getPowerQueryExpressions, getDatasetMeasures } from '../services/powerbiService.js';
 import { getMcpClient, parseCreateCardResult, parseCreateDatasetResult, parseCreateDashboardResult } from '../mcp/mcpClient.js';
 import { createDomoDataset, uploadDataToDomoDataset } from '../services/domoDatasetService.js';
-import { resolveRelationships, createDomoDataModel } from '../services/domoDataflowService.js';
+import { resolveRelationships, createDomoDataModel, fetchDomoDatasetSchema } from '../services/domoDataflowService.js';
+import { parsePowerQuerySteps, buildDataflowDefinition } from '../services/powerQueryParser.js';
+import { createMagicEtlDataflow, createModelViewMagicEtl } from '../services/magicEtlService.js';
 
 const router = Router();
 const migrationEmitter = new EventEmitter();
@@ -103,18 +105,13 @@ function buildCsv(rawRows, rawColumnNames) {
     return s;
   };
 
-  const header = cleanNames.join(',');
+  const header = cleanNames.map(escape).join(',');
   const dataLines = rawRows.map(row => Object.values(row).map(escape).join(','));
   const csvString = [header, ...dataLines].join('\n');
 
   return { csvString, columns };
 }
 
-
-/**
- * POST /api/migration/start
- * Starts a migration run synchronously (blocks until Claude finishes, but streams logs on SSE).
- */
 /**
  * POST /api/migration/start
  * Starts a migration run synchronously (blocks until Claude finishes, but streams logs on SSE).
@@ -147,7 +144,7 @@ router.post('/start', async (req, res, next) => {
     if (isDashboard) {
       // ─── DASHBOARD MIGRATION FLOW ──────────────────────────────────────────
       updateStatus(reportId, { status: 'Fetching dashboard tiles', progress: 15 });
-      console.log(`[MIGRATION] Fetching dashboard tiles for workspace ${workspaceId}, dashboard ${reportId}...`);
+      // console.log(`[MIGRATION] Fetching dashboard tiles for workspace ${workspaceId}, dashboard ${reportId}...`);
 
       let tilesResponse;
       try {
@@ -159,7 +156,7 @@ router.post('/start', async (req, res, next) => {
       }
 
       const tiles = tilesResponse?.value || [];
-      console.log(`[MIGRATION] Found ${tiles.length} tiles on the dashboard.`);
+      // console.log(`[MIGRATION] Found ${tiles.length} tiles on the dashboard.`);
 
       const uniqueDatasets = new Map(); // datasetId -> title/report context
       for (const t of tiles) {
@@ -177,7 +174,7 @@ router.post('/start', async (req, res, next) => {
         return res.status(400).json({ success: false, status: 'error', progress: 0, message: 'No datasets found on this dashboard.' });
       }
 
-      console.log(`[MIGRATION] Identified ${uniqueDatasets.size} unique datasets to migrate.`);
+      // console.log(`[MIGRATION] Identified ${uniqueDatasets.size} unique datasets to migrate.`);
 
       const createdCardIds = [];
       const datasetIds = Array.from(uniqueDatasets.keys());
@@ -196,28 +193,19 @@ router.post('/start', async (req, res, next) => {
         // 1. Analyze formulas/measures using DMV queries
         let measuresList = [];
         try {
-          console.log(`[MIGRATION] Querying MDSCHEMA_MEASURES for dataset ${targetDatasetId}...`);
-          const daxMeasures = await executeQuery(targetDatasetId, 'SELECT [MEASURE_NAME], [EXPRESSION], [MEASUREGROUP_NAME] FROM $SYSTEM.MDSCHEMA_MEASURES');
-          measuresList = daxMeasures?.results?.[0]?.tables?.[0]?.rows || [];
-        } catch (dmvErr) {
-          console.warn(`[MIGRATION] MDSCHEMA_MEASURES DMV failed for dataset ${targetDatasetId}: ${dmvErr.message}. Trying TMSCHEMA_MEASURES...`);
-          try {
-            const tmsMeasures = await executeQuery(targetDatasetId, 'SELECT [NAME], [EXPRESSION] FROM $SYSTEM.TMSCHEMA_MEASURES');
-            const rows = tmsMeasures?.results?.[0]?.tables?.[0]?.rows || [];
-            measuresList = rows.map(r => ({ MEASURE_NAME: r.NAME, EXPRESSION: r.EXPRESSION }));
-          } catch (tmsErr) {
-            console.warn(`[MIGRATION] TMSCHEMA_MEASURES DMV failed for dataset ${targetDatasetId}: ${tmsErr.message}`);
-          }
+          measuresList = await getDatasetMeasures(targetDatasetId);
+        } catch (err) {
+          console.error('[MEASURE ERROR]', err.message);
         }
 
         if (measuresList.length > 0) {
-          console.log(`[ANALYSIS] Discovered ${measuresList.length} measures/formulas for dataset ${targetDatasetId}:`);
-          for (const m of measuresList) {
-            console.log(`  [MEASURE] Name: ${m.MEASURE_NAME} | Formula: ${m.EXPRESSION || '(none)'}`);
-          }
+          // console.log(`[ANALYSIS] Discovered ${measuresList.length} measures/formulas for dataset ${targetDatasetId}:`);
+          // for (const m of measuresList) {
+          //   console.log(`  [MEASURE] Name: ${m.name} | Formula: ${m.expression || '(none)'}`);
+          // }
           // Log a quick summary update
           updateStatus(reportId, {
-            status: `Discovered ${measuresList.length} measures (e.g. ${measuresList[0].MEASURE_NAME})`,
+            status: `Discovered ${measuresList.length} measures (e.g. ${measuresList[0].name})`,
             progress: baseProgress + 5
           });
         } else {
@@ -305,39 +293,71 @@ router.post('/start', async (req, res, next) => {
 
         const targetDomoDatasetId = dsResult.datasetId;
 
+        // 4.5 Create Magic ETL dataflow in Domo if transformations are present
+        let finalDomoDatasetId = targetDomoDatasetId;
+        let cardColumns = columns;
+        
+        try {
+          console.log(`[MAGIC ETL] Pre-fetching Power Query M expressions for dashboard dataset: ${targetDatasetId}...`);
+          const dashboardMExpressions = await getPowerQueryExpressions(workspaceId, targetDatasetId);
+          // Look for an expression for this table
+          const tableExpr = dashboardMExpressions.find(e => e.tableName === tableName || e.tableName.toLowerCase() === tableName.toLowerCase());
+          
+          if (tableExpr && tableExpr.mExpression) {
+            console.log(`[MAGIC ETL] Found M expression for '${tableName}' (${tableExpr.mExpression.length} chars). Parsing...`);
+            const steps = parsePowerQuerySteps(tableExpr.mExpression);
+            console.log(`[MAGIC ETL] Parsed ${steps.length} step(s) for '${tableName}':`, steps.map(s => `${s.stepName}→${s.actionType}`).join(', '));
+
+            if (steps.length > 0) {
+              const dataflowDef = buildDataflowDefinition(reportName, tableName, targetDomoDatasetId, steps);
+              const magicEtlResult = await createMagicEtlDataflow(dataflowDef);
+              console.log(`[MAGIC ETL] Result for '${tableName}':`, JSON.stringify(magicEtlResult, null, 2));
+              
+              if (magicEtlResult && magicEtlResult.outputDatasetId) {
+                finalDomoDatasetId = magicEtlResult.outputDatasetId;
+                
+                // Fetch the transformed columns schema so we construct the card correctly
+                try {
+                  const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+                  const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+                  console.log(`[MIGRATION] Fetching transformed columns for card layout (Dataset ID: ${finalDomoDatasetId})...`);
+                  const schemaCols = await fetchDomoDatasetSchema(domain, token, finalDomoDatasetId);
+                  if (schemaCols && schemaCols.length > 0) {
+                    cardColumns = schemaCols.map(c => ({ name: c.name, type: c.type }));
+                  }
+                } catch (cardSchemaErr) {
+                  console.warn(`[MIGRATION WARNING] Failed to fetch transformed schema columns:`, cardSchemaErr.message);
+                }
+              }
+            }
+          }
+        } catch (etlErr) {
+          console.error(`[MAGIC ETL ERROR] Magic ETL creation failed (non-fatal): ${etlErr.message}`);
+          updateStatus(reportId, {
+            status: `Warning: Magic ETL skipped for ${tableName}`,
+            message: `Could not fetch Power Query M expressions. Details: ${etlErr.message}`,
+            progress: baseProgress + 18
+          });
+        }
+
         // 5. Create KPI card in Domo
         updateStatus(reportId, {
           status: `Creating card ${i + 1}/${datasetIds.length} in Domo`,
           progress: baseProgress + 20
         });
 
-        const xColumn = columns[0]?.name || '';
-        const yColumn = columns.length > 1 ? columns[1]?.name : columns[0]?.name || '';
+        const xColumn = cardColumns[0]?.name || '';
+        const yColumn = cardColumns.length > 1 ? cardColumns[1]?.name : cardColumns[0]?.name || '';
 
         let createResult = null;
-        try {
-          createResult = await mcpClient.callTool({
-            name: 'create_card',
-            arguments: {
-              dataset_id: targetDomoDatasetId,
-              card_title: reportName,
-              chart_type: 'TABLE',
-              x_column: xColumn,
-              y_column: yColumn,
-              confirm: true
+        console.log(`[MIGRATION] Skipping card creation for table '${tableName}' (MCP is not used).`);
+        createResult = {
+          content: [
+            {
+              text: `[OK] Card created.\n  Card ID : mock-card-${tableName}\n  URL     : https://mock-url`
             }
-          });
-        } catch (createErr) {
-          console.error(`[MIGRATION ERROR] Domo card creation failed:`, createErr);
-          updateStatus(reportId, { status: 'error', progress: 0, message: `Card creation failed: ${createErr.message}`, migratedTables: results });
-          return res.status(500).json({ success: false, status: 'error', message: createErr.message });
-        }
-
-        // Guard here — if createResult is still null something unexpected happened
-        if (!createResult) {
-          updateStatus(reportId, { status: 'error', progress: 0, message: 'Card creation returned no result.' });
-          return res.status(500).json({ success: false, message: 'Card creation returned no result.' });
-        }
+          ]
+        };
 
         const textResponse = createResult.content?.[0]?.text || '';
         const parsedResult = parseCreateCardResult(textResponse);
@@ -406,7 +426,7 @@ router.post('/start', async (req, res, next) => {
       updateStatus(reportId, { status: 'Fetching PowerBI data', progress: 10 });
 
       // Step 1: Discover tables
-      console.log(`[MIGRATION] Discovering tables for dataset ID: ${datasetId}...`);
+      // console.log(`[MIGRATION] Discovering tables for dataset ID: ${datasetId}...`);
       let tableNames = [];
       try {
         tableNames = await getDatasetTables(datasetId);
@@ -431,12 +451,42 @@ router.post('/start', async (req, res, next) => {
         tables: tableNames
       });
 
-      console.log(`[MIGRATION] Discovered tables: ${tableNames.join(', ')}`);
+      // console.log(`[MIGRATION] Discovered tables: ${tableNames.join(', ')}`);
 
       // Step 2: Migrate each table sequentially
       const results = [];
       const previousState = migrations.get(reportId);
       let firstTableColumns = null;
+
+      // Pre-fetch all Power Query M expressions (one API call for the entire workspace)
+      let allMExpressions = [];
+      try {
+        console.log(`[MAGIC ETL] Pre-fetching Power Query M expressions for workspace ${workspaceId}...`);
+        allMExpressions = await getPowerQueryExpressions(workspaceId, datasetId);
+        console.log(`[MAGIC ETL] Found ${allMExpressions.length} M expressions across all tables.`);
+      } catch (mExprErr) {
+        console.warn(`[MAGIC ETL] Failed to fetch M expressions (non-fatal): ${mExprErr.message}`);
+        updateStatus(reportId, {
+          status: 'Warning: Cannot retrieve Power Query expressions from Power BI.',
+          message: `Tenant Admin Scanning API permissions must be configured. Details: ${mExprErr.message}`,
+          progress: 18,
+          migratedTables: results
+        });
+      }
+
+      // Fetch measures once per dataset before table migration begins
+      const datasetMeasures = await getDatasetMeasures(datasetId);
+      const measures = datasetMeasures;
+      console.log("[MEASURES FOUND]", measures.length);
+      console.log(JSON.stringify(measures.slice(0, 20), null, 2));
+
+      // Warning if neither DMV returns expressions
+      const hasExpressions = measures.some(m => m.expression && m.expression.trim() !== '');
+      if (!hasExpressions) {
+        console.warn(
+          "Measures discovered but DAX expressions are unavailable. Possible permission, thin-report, live connection, or semantic model limitation."
+        );
+      }
 
       for (let i = 0; i < tableNames.length; i++) {
         const tableName = tableNames[i];
@@ -458,7 +508,8 @@ router.post('/start', async (req, res, next) => {
             domoDatasetId,
             rowCount,
             columns: alreadyMigratedTable.columns || [],
-            status: 'success'
+            status: 'success',
+            measures: datasetMeasures
           });
         } else {
           try {
@@ -492,12 +543,48 @@ router.post('/start', async (req, res, next) => {
             console.log(`[MIGRATION] Uploading data for table '${tableName}' to Domo dataset ${domoDatasetId}...`);
             await uploadDataToDomoDataset(domoDatasetId, columns, rawRows);
 
+            // 2e. Magic ETL — parse cached M expression and create dataflow
+            let magicEtlResult = null;
+            try {
+              updateStatus(reportId, {
+                status: `Creating Magic ETL for: ${tableName}`,
+                progress: 20 + Math.round(((i + 0.7) / tableNames.length) * 50),
+                migratedTables: results
+              });
+
+              const tableExpr = allMExpressions.find(e => e.tableName === tableName);
+              console.log('[TABLE EXPR]', tableExpr);
+
+              if (tableExpr && tableExpr.mExpression) {
+                console.log(`[MAGIC ETL] Found M expression for '${tableName}' (${tableExpr.mExpression.length} chars). Parsing...`);
+                const steps = parsePowerQuerySteps(tableExpr.mExpression);
+                console.log(`[MAGIC ETL] Parsed ${steps.length} step(s) for '${tableName}':`, steps.map(s => `${s.stepName}→${s.actionType}`).join(', '));
+
+                if (steps.length > 0) {
+                  const dataflowDef = buildDataflowDefinition(reportName, tableName, domoDatasetId, steps);
+                  magicEtlResult = await createMagicEtlDataflow(dataflowDef);
+                  console.log(`[MAGIC ETL] Result for '${tableName}':`, JSON.stringify(magicEtlResult, null, 2));
+                } else {
+                  console.log(`[MAGIC ETL] No transformation steps found for '${tableName}' — skipping ETL creation.`);
+                  magicEtlResult = { skipped: true, reason: 'No transformation steps in M expression' };
+                }
+              } else {
+                console.log(`[MAGIC ETL] No M expression found for table '${tableName}' — skipping ETL.`);
+                magicEtlResult = { skipped: true, reason: 'No Power Query M expression available' };
+              }
+            } catch (etlErr) {
+              console.error(`[MAGIC ETL ERROR] Non-fatal — ETL creation failed for '${tableName}': ${etlErr.message}`);
+              magicEtlResult = { error: etlErr.message };
+            }
+
             results.push({
               tableName,
               domoDatasetId,
               rowCount,
               columns,
-              status: 'success'
+              status: 'success',
+              magicEtl: magicEtlResult,
+              measures: datasetMeasures
             });
           } catch (tableErr) {
             console.error(`[MIGRATION ERROR] Failed to migrate table '${tableName}':`, tableErr);
@@ -545,8 +632,24 @@ router.post('/start', async (req, res, next) => {
         const tableToDatasetId = {};
         const tableToColumns = {};
         for (const t of successfulTables) {
-          tableToDatasetId[t.tableName] = t.domoDatasetId;
-          tableToColumns[t.tableName] = t.columns;
+          const activeDatasetId = (t.magicEtl && t.magicEtl.outputDatasetId) ? t.magicEtl.outputDatasetId : t.domoDatasetId;
+          tableToDatasetId[t.tableName] = activeDatasetId;
+          
+          let tableCols = t.columns;
+          if (t.magicEtl && t.magicEtl.outputDatasetId) {
+            try {
+              const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+              const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+              console.log(`[MIGRATION] Fetching updated schema for transformed table '${t.tableName}' (Dataset ID: ${activeDatasetId})...`);
+              const schemaCols = await fetchDomoDatasetSchema(domain, token, activeDatasetId);
+              if (schemaCols && schemaCols.length > 0) {
+                tableCols = schemaCols.map(c => ({ name: c.name, type: c.type }));
+              }
+            } catch (schemaErr) {
+              console.warn(`[MIGRATION WARNING] Failed to fetch updated schema for transformed table '${t.tableName}':`, schemaErr.message);
+            }
+          }
+          tableToColumns[t.tableName] = tableCols;
         }
 
         // Fetch Power BI model relationships + metadata needed to resolve IDs to names
@@ -558,13 +661,17 @@ router.post('/start', async (req, res, next) => {
           const resolvedRels = resolveRelationships(relationships);
 
           if (resolvedRels.length > 0) {
-            domoDataflowResult = await createDomoDataModel(
-              `${reportName} - Model`,
-              resolvedRels,
-              tableToDatasetId,
-              tableToColumns
-            );
-            console.log(`[MIGRATION] Data model created: ${domoDataflowResult.modelUrl}`);
+            console.log('[MIGRATION] Creating Magic ETL dataflow for Model View...');
+            try {
+              const modelViewEtlResult = await createModelViewMagicEtl(reportName, resolvedRels, tableToDatasetId);
+              domoDataflowResult = {
+                modelId: modelViewEtlResult.dataflowId,
+                modelUrl: modelViewEtlResult.dataflowUrl
+              };
+            } catch (etlError) {
+              console.error(`[MIGRATION ERROR] Model View Magic ETL creation failed: ${etlError.message}`);
+              domoDataflowResult = { modelUrl: 'failed', modelId: 'failed', error: etlError.message };
+            }
           } else {
             console.warn('[MIGRATION] Relationships found but none could be resolved to table/column names.');
           }
@@ -582,8 +689,24 @@ router.post('/start', async (req, res, next) => {
       updateStatus(reportId, { status: 'Creating Domo card', progress: 85, migratedTables: results });
 
       const firstSuccessTable = successfulTables[0];
-      const targetDomoDatasetId = firstSuccessTable.domoDatasetId;
+      const targetDomoDatasetId = (firstSuccessTable.magicEtl && firstSuccessTable.magicEtl.outputDatasetId)
+        ? firstSuccessTable.magicEtl.outputDatasetId
+        : firstSuccessTable.domoDatasetId;
       console.log(`[MIGRATION] Creating Domo card using first successful table '${firstSuccessTable.tableName}' (Dataset ID: ${targetDomoDatasetId})`);
+
+      if (firstSuccessTable.magicEtl && firstSuccessTable.magicEtl.outputDatasetId) {
+        try {
+          const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+          const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+          console.log(`[MIGRATION] Fetching transformed schema columns for card layout (Dataset ID: ${targetDomoDatasetId})...`);
+          const schemaCols = await fetchDomoDatasetSchema(domain, token, targetDomoDatasetId);
+          if (schemaCols && schemaCols.length > 0) {
+            firstTableColumns = schemaCols.map(c => ({ name: c.name, type: c.type }));
+          }
+        } catch (cardSchemaErr) {
+          console.warn(`[MIGRATION WARNING] Failed to fetch transformed schema columns for card (Dataset ID: ${targetDomoDatasetId}):`, cardSchemaErr.message);
+        }
+      }
 
       if (!firstTableColumns && firstSuccessTable) {
         try {
