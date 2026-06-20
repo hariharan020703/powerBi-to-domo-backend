@@ -38,11 +38,10 @@ export const env = {
   nodeEnv: process.env.NODE_ENV || 'production',
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
 
-  // Anthropic and Domo MCP configurations
+  // Anthropic and Domo configurations
   anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-  domoMcpScriptPath: path.resolve(__dirname, '../mcp/domoMcpTool.js'),
   domoClientDomain: process.env.DOMO_CLIENT_DOMAIN,
   domoClientToken: process.env.DOMO_CLIENT_TOKEN,
   domoAgentEmail: process.env.DOMO_AGENT_EMAIL || 'your_email@gwcdata.ai',
-  domoAgentRole: process.env.DOMO_AGENT_ROLE || 'deployer'
+  domoAgentRole: process.env.DOMO_AGENT_ROLE || 'deployer',
 };

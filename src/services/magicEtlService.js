@@ -16,7 +16,63 @@ function resetTileCounter() {
   _tileCounter = 0;
 }
 
-// ─── GUI Helpers ──────────────────────────────────────────────────────────────
+async function requestWithRetry(requestFn, maxRetries = 5) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await requestFn();
+    } catch (error) {
+      attempt++;
+      const status = error.response ? error.response.status : null;
+      const isRetryable = !status || status === 429 || status >= 500;
+
+      if (attempt > maxRetries || !isRetryable) {
+        throw error;
+      }
+
+      // Exponential backoff: 2s, 4s, 8s...
+      const backoffDelay = 2000 * Math.pow(2, attempt);
+      console.warn(`[MAGIC ETL SERVICE] Request failed (${error.message}). Retrying in ${backoffDelay}ms (Attempt ${attempt}/${maxRetries})...`);
+      await new Promise(resolve => setTimeout(resolve, backoffDelay));
+    }
+  }
+}
+
+async function fetchDatasetColumns(domain, token, datasetId) {
+  const headers = {
+    'X-DOMO-DEVELOPER-TOKEN': token,
+    'Content-Type': 'application/json'
+  };
+
+  return requestWithRetry(async () => {
+    try {
+      const v3Url = `https://${domain}/api/data/v3/datasources/${datasetId}`;
+      console.log(`[SCHEMA] Fetching v3 schema: ${v3Url}`);
+      const v3Response = await axios.get(v3Url, { headers, timeout: 15000 });
+      const cols = v3Response.data?.schema?.columns || v3Response.data?.columns;
+      if (cols && cols.length > 0) {
+        return cols.map(c => c.name || c.columnName);
+      }
+      return [];
+    } catch (v3Err) {
+      const status = v3Err.response?.status;
+      console.warn(`[SCHEMA] v3 schema fetch failed with status ${status}: ${v3Err.message}`);
+      if (status === 404) {
+        try {
+          const v1Url = `https://${domain}/api/data/v1/datasources/${datasetId}/schemas/latest?includeHidden=false`;
+          console.log(`[SCHEMA] Falling back to v1 schema: ${v1Url}`);
+          const v1Response = await axios.get(v1Url, { headers, timeout: 15000 });
+          const cols = v1Response.data?.columns || v1Response.data?.schema?.columns || [];
+          return cols.map(c => c.name || c.columnName);
+        } catch (v1Err) {
+          console.error(`[SCHEMA] v1 schema fetch also failed:`, v1Err.message);
+          throw v1Err;
+        }
+      }
+      throw v3Err;
+    }
+  });
+}
 
 /**
  * Creates the gui object for an individual action tile.
@@ -63,9 +119,39 @@ function buildOutputAction(id, name, x, y, dependsOnId) {
 }
 
 /**
+ * Helper to compute excludeColumns2 case-insensitively.
+ * Excludes any column in rightCols if it exists in leftCols (duplicate check) or is one of the rightKeys.
+ */
+function getExcludeColumns(leftCols, rightCols, rightKeys) {
+  const leftColSet = new Set(
+    (leftCols || [])
+      .filter(Boolean)
+      .map(c => String(c).trim().toLowerCase())
+  );
+
+  const rKeys = (Array.isArray(rightKeys) ? rightKeys : [rightKeys])
+    .filter(Boolean)
+    .map(k => String(k).trim().toLowerCase());
+
+  const toExclude = [];
+
+  for (const col of (rightCols || [])) {
+    if (!col) continue;
+
+    const colLower = String(col).trim().toLowerCase();
+
+    if (leftColSet.has(colLower) || rKeys.includes(colLower)) {
+      toExclude.push(col);
+    }
+  }
+
+  return toExclude;
+}
+
+/**
  * Build a JoinAction tile.
  */
-function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, step2Id) {
+function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, step2Id, leftColumns = [], rightColumns = []) {
   // Map joinType to Domo format
   const domoJoinType = joinType === 'LEFT' ? 'LEFT OUTER'
     : joinType === 'INNER' ? 'INNER'
@@ -85,6 +171,12 @@ function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, s
     step2: step2Id,
     keys1: Array.isArray(leftKey) ? leftKey : [leftKey],
     keys2: Array.isArray(rightKey) ? rightKey : [rightKey],
+    excludeColumns2: getExcludeColumns(
+      leftColumns,
+      rightColumns,
+      leftKey,
+      rightKey
+    )
   };
 }
 
@@ -545,6 +637,7 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
 }
 
 // ─── createModelViewMagicEtl ──────────────────────────────────────────────────
+const _modelViewInFlight = new Map();
 
 /**
  * Creates a Magic ETL dataflow in Domo representing the Model View (joined relationships).
@@ -555,230 +648,325 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
  * @returns {Promise<object>} Created dataflow info
  */
 export async function createModelViewMagicEtl(reportName, resolvedRels, tableToDatasetId) {
-  const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
-  const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-
-  if (!domain || !token) {
-    throw new Error('Domo domain or developer token environment variables are not set.');
+  if (_modelViewInFlight.has(reportName)) {
+    console.log(`[CONCURRENCY] A request for Model View ETL for reportName '${reportName}' is already in-flight. Awaiting it.`);
+    return _modelViewInFlight.get(reportName);
   }
 
-  const validRels = resolvedRels.filter(r =>
-    tableToDatasetId[r.fromTable] && tableToDatasetId[r.toTable]
-  );
+  const promise = (async () => {
+    const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+    const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
 
-  if (validRels.length === 0) {
-    throw new Error('No valid relationships found between migrated Domo datasets.');
-  }
+    if (!domain || !token) {
+      throw new Error('Domo domain or developer token environment variables are not set.');
+    }
 
-  const involvedTables = new Set();
-  for (const r of validRels) {
-    involvedTables.add(r.fromTable);
-    involvedTables.add(r.toTable);
-  }
-  const uniqueTables = Array.from(involvedTables);
-
-  const headers = getAuthHeaders(token);
-  resetTileCounter();
-
-  // ── 1. Input Tiles (LoadFromVault) ──
-  const actions = [];
-  const tableToTileId = {};
-
-  uniqueTables.forEach((tableName, index) => {
-    const tileId = nextTileId('input');
-    tableToTileId[tableName] = tileId;
-    actions.push(
-      buildLoadAction(tileId, tableName, tableToDatasetId[tableName], 100, 100 + index * 120)
+    const validRels = resolvedRels.filter(r =>
+      tableToDatasetId[r.fromTable] && tableToDatasetId[r.toTable]
     );
-  });
 
-  // ── 2. Join Tiles (MergeJoin) ──
-  const joinedTables = new Set();
-  const remainingRels = [...validRels];
-  let joinIndex = 0;
-  let activeStreamId = null;
-  const joinXStart = 300;
-  const joinXStep = 200;
-
-  while (remainingRels.length > 0) {
-    let relIndex = -1;
-    if (joinedTables.size > 0) {
-      relIndex = remainingRels.findIndex(r =>
-        (joinedTables.has(r.fromTable) && !joinedTables.has(r.toTable)) ||
-        (joinedTables.has(r.toTable) && !joinedTables.has(r.fromTable))
-      );
-    } else {
-      relIndex = 0;
+    if (validRels.length === 0) {
+      throw new Error('No valid relationships found between migrated Domo datasets.');
     }
 
-    if (relIndex !== -1) {
-      const rel = remainingRels[relIndex];
-      remainingRels.splice(relIndex, 1);
+    const involvedTables = new Set();
+    for (const r of validRels) {
+      involvedTables.add(r.fromTable);
+      involvedTables.add(r.toTable);
+    }
+    const uniqueTables = Array.from(involvedTables);
 
-      const fromTable = rel.fromTable;
-      const toTable = rel.toTable;
+    const headers = getAuthHeaders(token);
+    resetTileCounter();
 
-      let joinName;
+    // ── 1. Input Tiles (LoadFromVault) ──
+    const actions = [];
+    const tableToTileId = {};
+    const tableToColumns = {};
 
-      if (joinedTables.size === 0) {
-        joinName = `Join ${fromTable} & ${toTable}`;
-        joinedTables.add(fromTable);
-        joinedTables.add(toTable);
-      } else if (joinedTables.has(fromTable)) {
-        joinName = `Join ${toTable} to Model`;
-        joinedTables.add(toTable);
+    await Promise.all(
+      uniqueTables.map(async (tableName, index) => {
+        const inputTileId = nextTileId('input');
+        tableToTileId[tableName] = inputTileId;
+        actions.push(
+          buildLoadAction(inputTileId, tableName, tableToDatasetId[tableName], 100, 100 + index * 120)
+        );
+        tableToColumns[tableName] = await fetchDatasetColumns(domain, token, tableToDatasetId[tableName]);
+      })
+    );
+
+    // ── 2. Join Tiles (MergeJoin) ──
+    const joinedTables = new Set();
+    const accumulatedLeftCols = new Set();
+    const remainingRels = [...validRels];
+    let joinIndex = 0;
+    let activeStreamId = null;
+    const joinXStart = 450;
+    const joinXStep = 200;
+
+    while (remainingRels.length > 0) {
+      let relIndex = -1;
+      if (joinedTables.size > 0) {
+        relIndex = remainingRels.findIndex(r =>
+          (joinedTables.has(r.fromTable) && !joinedTables.has(r.toTable)) ||
+          (joinedTables.has(r.toTable) && !joinedTables.has(r.fromTable))
+        );
       } else {
-        joinName = `Join ${fromTable} to Model`;
+        relIndex = 0;
+      }
+
+      if (relIndex !== -1) {
+        const rel = remainingRels[relIndex];
+        remainingRels.splice(relIndex, 1);
+
+        const fromTable = rel.fromTable;
+        const toTable = rel.toTable;
+
+        let joinName;
+        let rightTable;
+        let leftKey;
+        let rightKey;
+
+        if (joinedTables.size === 0) {
+          joinName = `Join ${fromTable} & ${toTable}`;
+          joinedTables.add(fromTable);
+          joinedTables.add(toTable);
+
+          // Initialize accumulatedLeftCols with fromTable columns
+          (tableToColumns[fromTable] || []).forEach(c => accumulatedLeftCols.add(c));
+
+          rightTable = toTable;
+          leftKey = rel.fromColumn;
+          rightKey = rel.toColumn;
+        } else {
+          if (joinedTables.has(fromTable)) {
+            joinName = `Join ${toTable} to Model`;
+            joinedTables.add(toTable);
+            rightTable = toTable;
+            leftKey = rel.fromColumn;
+            rightKey = rel.toColumn;
+          } else {
+            joinName = `Join ${fromTable} to Model`;
+            joinedTables.add(fromTable);
+            rightTable = fromTable;
+            leftKey = rel.toColumn;
+            rightKey = rel.fromColumn;
+          }
+        }
+
+        let joinType = 'INNER';
+        if (rel.crossFilter === 'BothDirections') {
+          joinType = 'LEFT';
+        } else if (rel.crossFilter === 'OneDirection') {
+          joinType = rel.fromCardinality === 'One' ? 'LEFT' : 'INNER';
+        }
+
+        const joinTileId = nextTileId('join');
+        const jx = joinXStart + joinIndex * joinXStep;
+        const jy = 150 + joinIndex * 50;
+
+        const isFirstJoin = activeStreamId === null;
+        const step1Id = isFirstJoin ? tableToTileId[fromTable] : activeStreamId;
+        const step2Id = tableToTileId[rightTable];
+
+        const leftColsArray = Array.from(accumulatedLeftCols);
+        const rightColsArray = tableToColumns[rightTable] || [];
+
+        actions.push(
+          buildJoinAction(
+            joinTileId,
+            joinName,
+            joinType,
+            leftKey,
+            rightKey,
+            jx,
+            jy,
+            step1Id,
+            step2Id,
+            leftColsArray,
+            rightColsArray
+          )
+        );
+
+        const excludeColumns2 = getExcludeColumns(leftColsArray, rightColsArray, rightKey);
+        const excludedSet = new Set(excludeColumns2.map(c => c.toLowerCase()));
+
+        rightColsArray.forEach(c => {
+          if (!excludedSet.has(c.toLowerCase())) {
+            accumulatedLeftCols.add(c);
+          }
+        });
+
+        activeStreamId = joinTileId;
+        joinIndex++;
+
+      } else {
+        // Disconnected graph fallback
+        const rel = remainingRels.shift();
+        const fromTable = rel.fromTable;
+        const toTable = rel.toTable;
+
+        const subJoinTileId = nextTileId('join-sub');
+        const sjx = joinXStart + joinIndex * joinXStep;
+
+        const leftKey = rel.fromColumn;
+        const rightKey = rel.toColumn;
+
+        const leftColsSub = tableToColumns[fromTable] || [];
+        const rightColsSub = tableToColumns[toTable] || [];
+
+        actions.push(
+          buildJoinAction(
+            subJoinTileId,
+            `Join ${fromTable} & ${toTable} (Sub-branch)`,
+            'INNER',
+            leftKey,
+            rightKey,
+            sjx,
+            350,
+            tableToTileId[fromTable],
+            tableToTileId[toTable],
+            leftColsSub,
+            rightColsSub
+          )
+        );
+        joinIndex++;
+
+        // Compute sub-branch output columns
+        const excludeColumns2Sub = getExcludeColumns(leftColsSub, rightColsSub, rightKey);
+        const excludedSetSub = new Set(excludeColumns2Sub.map(c => c.toLowerCase()));
+
+        const subBranchCols = [...leftColsSub];
+        rightColsSub.forEach(c => {
+          if (!excludedSetSub.has(c.toLowerCase())) {
+            subBranchCols.push(c);
+          }
+        });
+
+        const mergeJoinTileId = nextTileId('join-merge');
+        const mjx = joinXStart + joinIndex * joinXStep;
+
+        const leftMergeKey = rel.fromColumn;
+        const rightMergeKey = rel.fromColumn;
+
+        const leftColsMerge = Array.from(accumulatedLeftCols);
+
+        actions.push(
+          buildJoinAction(
+            mergeJoinTileId,
+            'Merge Disjoint Branches',
+            'LEFT',
+            leftMergeKey,
+            rightMergeKey,
+            mjx,
+            250,
+            activeStreamId,
+            subJoinTileId,
+            leftColsMerge,
+            subBranchCols
+          )
+        );
+
+        // Update accumulatedLeftCols with sub-branch columns after excluding right keys & duplicate columns
+        const excludeColumns2Merge = getExcludeColumns(leftColsMerge, subBranchCols, rightMergeKey);
+        const excludedSetMerge = new Set(excludeColumns2Merge.map(c => c.toLowerCase()));
+
+        subBranchCols.forEach(c => {
+          if (!excludedSetMerge.has(c.toLowerCase())) {
+            accumulatedLeftCols.add(c);
+          }
+        });
+
         joinedTables.add(fromTable);
+        joinedTables.add(toTable);
+        activeStreamId = mergeJoinTileId;
+        joinIndex++;
+      }
+    }
+
+    // ── 3. Output Tile (PublishToVault) ──
+    const outputDatasetName = `${reportName} - Model View Output`;
+    const outputTileId = nextTileId('output');
+    const outputX = joinXStart + joinIndex * joinXStep;
+
+    actions.push(
+      buildOutputAction(outputTileId, outputDatasetName, outputX, 200, activeStreamId)
+    );
+
+    // ── 4. Build inputs / outputs ──
+    const inputs = uniqueTables.map(tableName => ({
+      dataSourceId: tableToDatasetId[tableName],
+      dataSourceName: tableName,
+      executeFlowWhenUpdated: false,
+      onlyLoadNewVersions: false,
+      recentVersionCutoffMs: 0
+    }));
+
+    const outputs = [
+      {
+        dataSourceName: outputDatasetName,
+        versionChainType: 'REPLACE'
+      }
+    ];
+
+    // ── 5. Assemble full payload ──
+    const dataflowName = `${reportName} - Model View (Magic ETL)`;
+    const payload = buildMagicEtlPayload(
+      dataflowName,
+      actions,
+      inputs,
+      outputs
+    );
+
+    // ── 6. Validate before submission ──
+    validatePayload(payload);
+
+    // console.log(`[MAGIC ETL MODEL VIEW] Creating dataflow '${dataflowName}' with ${actions.length} action(s)...`);
+    // console.log(`[MAGIC ETL MODEL VIEW] Payload:`, JSON.stringify(payload, null, 2));
+
+    // ── 7. Submit ──
+    try {
+      const url = `https://${domain}/api/dataprocessing/v1/dataflows`;
+      console.log(`[MAGIC ETL MODEL VIEW] Submitting Magic ETL creation request to: ${url}`);
+      const response = await axios.post(url, payload, { headers, timeout: 60000 });
+
+      const dataflowId = response.data?.id || response.data?.dataFlowId || response.data?.dataflowId;
+      const respOutputs = response.data?.outputs || [];
+      const outputDatasetId = respOutputs[0]?.dataSourceId || respOutputs[0]?.id || respOutputs[0]?.datasetId || null;
+
+      if (!dataflowId) {
+        console.warn(`[MAGIC ETL MODEL VIEW] Dataflow may have been created but no ID in response:`, JSON.stringify(response.data));
+        return {
+          dataflowId: null,
+          dataflowUrl: null,
+          outputDatasetId: null,
+          response: response.data,
+        };
       }
 
-      let joinType = 'INNER';
-      if (rel.crossFilter === 'BothDirections') {
-        joinType = 'LEFT';
-      } else if (rel.crossFilter === 'OneDirection') {
-        joinType = rel.fromCardinality === 'One' ? 'LEFT' : 'INNER';
-      }
+      const dataflowUrl = `https://${domain}/datacenter/dataflows/${dataflowId}`;
+      console.log(`[MAGIC ETL MODEL VIEW] Created successfully. ID: ${dataflowId}, URL: ${dataflowUrl}, Output Dataset: ${outputDatasetId}`);
 
-      const joinTileId = nextTileId('join');
-      const jx = joinXStart + joinIndex * joinXStep;
-      const jy = 150 + joinIndex * 50;
-
-      // ── CHANGED: use activeStreamId for chained joins ──
-      const isFirstJoin = activeStreamId === null;
-      const step1Id = isFirstJoin ? tableToTileId[fromTable] : activeStreamId;
-      const step2Id = isFirstJoin
-        ? tableToTileId[toTable]
-        : joinedTables.has(fromTable)
-          ? tableToTileId[toTable]
-          : tableToTileId[fromTable];
-
-      actions.push(
-        buildJoinAction(joinTileId, joinName, joinType, rel.fromColumn, rel.toColumn, jx, jy, step1Id, step2Id)
-      );
-
-      activeStreamId = joinTileId;
-      joinIndex++;
-
-    } else {
-      // Disconnected graph fallback
-      const rel = remainingRels.shift();
-      const fromTable = rel.fromTable;
-      const toTable = rel.toTable;
-
-      const subJoinTileId = nextTileId('join-sub');
-      const sjx = joinXStart + joinIndex * joinXStep;
-      actions.push(
-        buildJoinAction(
-          subJoinTileId,
-          `Join ${fromTable} & ${toTable} (Sub-branch)`,
-          'INNER',
-          rel.fromColumn,
-          rel.toColumn,
-          sjx,
-          350,
-          tableToTileId[fromTable],  // ← step1Id
-          tableToTileId[toTable]     // ← step2Id
-        )
-      );
-      joinIndex++;
-
-      const mergeJoinTileId = nextTileId('join-merge');
-      const mjx = joinXStart + joinIndex * joinXStep;
-      actions.push(
-        buildJoinAction(
-          mergeJoinTileId,
-          'Merge Disjoint Branches',
-          'LEFT',
-          rel.fromColumn,
-          rel.fromColumn,
-          mjx,
-          250,
-          activeStreamId,   // ← step1Id (main stream)
-          subJoinTileId     // ← step2Id (sub-branch)
-        )
-      );
-
-      joinedTables.add(fromTable);
-      joinedTables.add(toTable);
-      activeStreamId = mergeJoinTileId;
-      joinIndex++;
-    }
-  }
-
-  // ── 3. Output Tile (PublishToVault) ──
-  const outputDatasetName = `${reportName} - Model View Output`;
-  const outputTileId = nextTileId('output');
-  const outputX = joinXStart + joinIndex * joinXStep;
-
-  actions.push(
-    buildOutputAction(outputTileId, outputDatasetName, outputX, 200, activeStreamId) // ← activeStreamId added
-  );
-
-  // ── 4. Build inputs / outputs ──
-  const inputs = uniqueTables.map(tableName => ({
-    dataSourceId: tableToDatasetId[tableName],   // ← was datasetId
-    dataSourceName: tableName,                    // ← was datasetName
-    executeFlowWhenUpdated: false,
-    onlyLoadNewVersions: false,
-    recentVersionCutoffMs: 0
-  }));
-
-  const outputs = [
-    {
-      dataSourceName: outputDatasetName,
-      versionChainType: 'REPLACE'
-    }
-  ];
-
-  // ── 5. Assemble full payload ──
-  const dataflowName = `${reportName} - Model View (Magic ETL)`;
-  const payload = buildMagicEtlPayload(
-    dataflowName,
-    actions,
-    inputs,
-    outputs
-  );
-
-  // ── 6. Validate before submission ──
-  validatePayload(payload);
-
-  console.log(`[MAGIC ETL MODEL VIEW] Creating dataflow '${dataflowName}' with ${actions.length} action(s)...`);
-  console.log(`[MAGIC ETL MODEL VIEW] Payload:`, JSON.stringify(payload, null, 2));
-
-  // ── 7. Submit ──
-  try {
-    const url = `https://${domain}/api/dataprocessing/v1/dataflows`;
-    console.log(`[MAGIC ETL MODEL VIEW] Submitting Magic ETL creation request to: ${url}`);
-    const response = await axios.post(url, payload, { headers, timeout: 60000 });
-
-    const dataflowId = response.data?.id || response.data?.dataFlowId || response.data?.dataflowId;
-    const respOutputs = response.data?.outputs || [];
-    const outputDatasetId = respOutputs[0]?.dataSourceId || respOutputs[0]?.id || respOutputs[0]?.datasetId || null;
-
-    if (!dataflowId) {
-      console.warn(`[MAGIC ETL MODEL VIEW] Dataflow may have been created but no ID in response:`, JSON.stringify(response.data));
       return {
-        dataflowId: null,
-        dataflowUrl: null,
-        outputDatasetId: null,
-        response: response.data,
+        dataflowId,
+        dataflowUrl,
+        outputDatasetId,
+        joinCount: joinIndex,
       };
+
+    } catch (error) {
+      const status = error.response ? error.response.status : 'N/A';
+      const body = error.response ? JSON.stringify(error.response.data) : error.message;
+      console.error(`[MAGIC ETL MODEL VIEW] Failed to create model view dataflow: HTTP ${status} - ${body}`);
+      throw new Error(`Failed to create Magic ETL for Model View: HTTP ${status} - ${body}`);
     }
+  })();
 
-    const dataflowUrl = `https://${domain}/datacenter/dataflows/${dataflowId}`;
-    console.log(`[MAGIC ETL MODEL VIEW] Created successfully. ID: ${dataflowId}, URL: ${dataflowUrl}, Output Dataset: ${outputDatasetId}`);
+  _modelViewInFlight.set(reportName, promise);
 
-    return {
-      dataflowId,
-      dataflowUrl,
-      outputDatasetId,
-      joinCount: joinIndex,
-    };
-
-  } catch (error) {
-    const status = error.response ? error.response.status : 'N/A';
-    const body = error.response ? JSON.stringify(error.response.data) : error.message;
-    console.error(`[MAGIC ETL MODEL VIEW] Failed to create model view dataflow: HTTP ${status} - ${body}`);
-    throw new Error(`Failed to create Magic ETL for Model View: HTTP ${status} - ${body}`);
+  try {
+    return await promise;
+  } finally {
+    _modelViewInFlight.delete(reportName);
   }
 }

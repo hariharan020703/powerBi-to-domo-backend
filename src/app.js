@@ -3,7 +3,6 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import { env } from './config/env.js';
-import { closeMcpClient } from './mcp/mcpClient.js';
 import { rateLimiter } from './middleware/rateLimiter.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import powerbiRouter from './routes/powerbi.routes.js';
@@ -58,14 +57,10 @@ const server = app.listen(env.port, () => {
 // Graceful shutdown handlers
 const gracefulShutdown = () => {
   console.log('[SERVER] Shutdown signal received. Cleaning up resources...');
-  closeMcpClient()
-    .catch((err) => console.error('[SERVER] Error closing MCP client on shutdown:', err))
-    .finally(() => {
-      server.close(() => {
-        console.log('[SERVER] HTTP server closed. Exit.');
-        process.exit(0);
-      });
-    });
+  server.close(() => {
+    console.log('[SERVER] HTTP server closed. Exit.');
+    process.exit(0);
+  });
 };
 
 process.on('SIGTERM', gracefulShutdown);

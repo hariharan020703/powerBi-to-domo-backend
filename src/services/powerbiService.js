@@ -6,7 +6,7 @@ import { getAccessToken } from './authService.js';
  * Executes an HTTP request function with retry logic and exponential backoff.
  * Retries on network errors, rate limiting (429), and server errors (>= 500).
  */
-async function requestWithRetry(requestFn, maxRetries = 3) {
+async function requestWithRetry(requestFn, maxRetries = 5) {
   let attempt = 0;
   while (true) {
     try {
@@ -20,8 +20,8 @@ async function requestWithRetry(requestFn, maxRetries = 3) {
         throw error;
       }
 
-      // Exponential backoff: 1s, 2s, 4s...
-      const backoffDelay = 1000 * Math.pow(2, attempt);
+      // Exponential backoff: 2s, 4s, 8s...
+      const backoffDelay = 2000 * Math.pow(2, attempt);
       console.warn(`[POWERBI SERVICE] Request failed (${error.message}). Retrying in ${backoffDelay}ms (Attempt ${attempt}/${maxRetries})...`);
       await new Promise(resolve => setTimeout(resolve, backoffDelay));
     }
