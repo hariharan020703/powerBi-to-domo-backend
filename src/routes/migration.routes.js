@@ -670,6 +670,15 @@ router.post('/start', async (req, res, next) => {
                 if (tableExpr && tableExpr.mExpression) {
                   console.log(`[MAGIC ETL] Found M expression for '${tableName}' (${tableExpr.mExpression.length} chars). Parsing...`);
                   const steps = parsePowerQuerySteps(tableExpr.mExpression);
+
+                  // Store ETL step metadata for downstream reporting
+                  const manualCount = steps.filter(s => s.actionType === 'MANUAL_BUILD').length;
+                  setTableState(tableName, {
+                    parsedStepCount: steps.length,
+                    manualStepCount: manualCount,
+                    parsedSteps: steps.map(s => ({ stepName: s.stepName, actionType: s.actionType, description: s.description }))
+                  });
+
                   if (steps.length > 0) {
                     const dataflowDef = buildDataflowDefinition(reportName, tableName, targetDomoDatasetId, steps);
                     magicEtlResult = await createMagicEtlDataflow(dataflowDef);
@@ -786,6 +795,12 @@ router.post('/start', async (req, res, next) => {
         domoDashboardId: 'mock-dashboard-id',
         domoCardUrl: 'https://mock-domo-url/page/mock-dashboard-id', // UI opens cardUrl when clicking View in Domo
         migratedTables: results,
+        etlStepSummary: results.map(t => ({
+          tableName: t.tableName,
+          parsedStepCount: t.parsedStepCount || 0,
+          manualStepCount: t.manualStepCount || 0,
+          parsedSteps: t.parsedSteps || [],
+        })),
         measureMigrationSummary: (migrations.get(reportId)?.migratedMeasures || []).map(m => ({
           measureName: m.name,
           classification: m.classification,
@@ -995,6 +1010,15 @@ router.post('/start', async (req, res, next) => {
               if (tableExpr && tableExpr.mExpression) {
                 console.log(`[MAGIC ETL] Found M expression for '${tableName}' (${tableExpr.mExpression.length} chars). Parsing...`);
                 const steps = parsePowerQuerySteps(tableExpr.mExpression);
+
+                // Store ETL step metadata for downstream reporting
+                const manualCount = steps.filter(s => s.actionType === 'MANUAL_BUILD').length;
+                setTableState(tableName, {
+                  parsedStepCount: steps.length,
+                  manualStepCount: manualCount,
+                  parsedSteps: steps.map(s => ({ stepName: s.stepName, actionType: s.actionType, description: s.description }))
+                });
+
                 if (steps.length > 0) {
                   const dataflowDef = buildDataflowDefinition(reportName, tableName, domoDatasetId, steps);
                   magicEtlResult = await createMagicEtlDataflow(dataflowDef);
@@ -1261,6 +1285,12 @@ router.post('/start', async (req, res, next) => {
         migratedTables: results,
         domoDataModelId: domoDataflowResult?.modelId || null,
         domoDataModelUrl: domoDataflowResult?.modelUrl || null,
+        etlStepSummary: results.map(t => ({
+          tableName: t.tableName,
+          parsedStepCount: t.parsedStepCount || 0,
+          manualStepCount: t.manualStepCount || 0,
+          parsedSteps: t.parsedSteps || [],
+        })),
         measureMigrationSummary: (migrations.get(reportId)?.migratedMeasures || []).map(m => ({
           measureName: m.name,
           classification: m.classification,

@@ -8,12 +8,29 @@ function getAuthHeaders(token) {
 }
 
 // ─── Unique ID Generator ──────────────────────────────────────────────────────
-let _tileCounter = 0;
-function nextTileId(prefix) {
-  return `${prefix}-${++_tileCounter}`;
+
+/**
+ * Creates a tile ID generator scoped to a single dataflow creation call.
+ * Prevents ID collisions when multiple migrations run concurrently.
+ *
+ * @returns {function(string): string} A function that takes a prefix and returns a unique tile ID
+ */
+function createTileIdGenerator() {
+  let count = 0;
+  return (prefix) => `${prefix}-${++count}`;
 }
-function resetTileCounter() {
-  _tileCounter = 0;
+
+/**
+ * Validates that required Domo environment variables are set.
+ * Throws if any are missing.
+ */
+function validateDomoEnv() {
+  const missing = ['DOMO_CLIENT_DOMAIN', 'DOMO_CLIENT_TOKEN'].filter(
+    k => !process.env[k]?.trim()
+  );
+  if (missing.length > 0) {
+    throw new Error(`Missing required Domo environment variables: ${missing.join(', ')}`);
+  }
 }
 
 async function requestWithRetry(requestFn, maxRetries = 5) {
@@ -150,8 +167,19 @@ function getExcludeColumns(leftCols, rightCols, rightKeys) {
 
 /**
  * Build a JoinAction tile.
+ *
+ * @param {string} id - Tile ID
+ * @param {string} name - Human-readable join name
+ * @param {string} joinType - JOIN type: LEFT, INNER, FULL
+ * @param {string|string[]} leftKey - Left join key column(s)
+ * @param {string|string[]} rightKey - Right join key column(s)
+ * @param {number} x - GUI x position
+ * @param {number} y - GUI y position
+ * @param {string} step1Id - Left input tile ID
+ * @param {string} step2Id - Right input tile ID
+ * @returns {object} MergeJoin action object
  */
-function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, step2Id, leftColumns = [], rightColumns = []) {
+function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, step2Id) {
   // Map joinType to Domo format
   const domoJoinType = joinType === 'LEFT' ? 'LEFT OUTER'
     : joinType === 'INNER' ? 'INNER'
@@ -171,25 +199,44 @@ function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, s
     step2: step2Id,
     keys1: Array.isArray(leftKey) ? leftKey : [leftKey],
     keys2: Array.isArray(rightKey) ? rightKey : [rightKey],
-    excludeColumns2: getExcludeColumns(
-      leftColumns,
-      rightColumns,
-      leftKey,
-      rightKey
-    )
   };
+}
+
+
+
+/**
+ * Maps Power Query M type names to Domo ETL type names.
+ *
+ * @param {string} mType - M type string (e.g. 'type number', 'Int64.Type')
+ * @returns {string} Domo ETL type: LONG, DOUBLE, DATE, DATETIME, or STRING
+ */
+function mapMTypeToEtlType(mType) {
+  const t = String(mType || '').toLowerCase().replace(/\s+/g, '');
+  if (t === 'int64.type' || t === 'integer' || t === 'long') return 'LONG';
+  if (t === 'typenumber' || t === 'double' || t === 'decimal') return 'DOUBLE';
+  if (t === 'typedate') return 'DATE';
+  if (t === 'typedatetime' || t === 'datetime') return 'DATETIME';
+  return 'STRING';
 }
 
 // ─── Step Mapper ──────────────────────────────────────────────────────────────
 
 /**
  * Maps a parsed ETL step (actionType + properties) into a valid Domo action object.
- * Every action includes: type, id, name, settings, gui
+ * Every action includes: type, id, name, dependsOn, settings, gui
+ *
+ * @param {object} step - Parsed step with actionType and properties
+ * @param {string} tileId - Unique tile ID
+ * @param {number} x - GUI x position
+ * @param {number} y - GUI y position
+ * @param {string|null} previousTileId - ID of the previous tile in the chain (for dependsOn)
+ * @returns {object} Domo action object
  */
-function mapStepToDomoAction(step, tileId, x, y) {
+function mapStepToDomoAction(step, tileId, x, y, previousTileId) {
   const base = {
     id: tileId,
     name: step.stepName || step.description || `Step ${tileId}`,
+    dependsOn: previousTileId ? [previousTileId] : [],
     gui: makeActionGui(x, y),
   };
 
@@ -197,7 +244,7 @@ function mapStepToDomoAction(step, tileId, x, y) {
     case 'FILTER':
       return {
         ...base,
-        type: 'FilterAction',
+        type: 'FilterRows',
         settings: {
           filterCondition: step.properties.condition || '',
         },
@@ -206,47 +253,56 @@ function mapStepToDomoAction(step, tileId, x, y) {
     case 'SELECT_COLUMNS':
       return {
         ...base,
-        type: 'SelectColumnsAction',
-        settings: {
-          columns: step.properties.columns || [],
-        },
+        type: 'SelectValues',
+        fields: (step.properties.columns || []).map(c => ({
+          name: c
+        })),
+        removeByDefault: true,
       };
 
     case 'REMOVE_COLUMNS':
       return {
         ...base,
-        type: 'RemoveColumnsAction',
-        settings: {
-          columns: step.properties.columns || [],
-        },
+        type: 'SelectValues',
+        fields: (step.properties.columns || []).map(c => ({
+          name: c,
+          remove: true
+        })),
+        removeByDefault: false,
       };
 
     case 'RENAME_COLUMNS':
       return {
         ...base,
-        type: 'RenameColumnsAction',
-        settings: {
-          renames: step.properties.renames || [],
-        },
+        type: 'SelectValues',
+        fields: (step.properties.renames || []).map(r => ({
+          name: r.from,
+          rename: r.to
+        })),
+        removeByDefault: false,
       };
 
     case 'SET_COLUMN_TYPE':
       return {
         ...base,
-        type: 'SetColumnTypeAction',
-        settings: {
-          columnTypes: step.properties.columns || [],
-        },
+        type: 'SelectValues',
+        fields: (step.properties.columns || []).map(c => ({
+          name: c.name,
+          type: mapMTypeToEtlType(c.toType)
+        })),
+        removeByDefault: false,
       };
 
     case 'ADD_FORMULA':
       return {
         ...base,
-        type: 'AddFormulaAction',
-        settings: {
-          columnName: step.properties.columnName || '',
-          formula: step.properties.formula || '',
-        },
+        type: 'ExpressionEvaluator',
+        expressions: [
+          {
+            fieldName: step.properties.columnName || '',
+            expression: step.properties.formula || '',
+          }
+        ]
       };
 
     case 'ADD_CONSTANT':
@@ -263,7 +319,7 @@ function mapStepToDomoAction(step, tileId, x, y) {
     case 'GROUP_BY':
       return {
         ...base,
-        type: 'GroupByAction',
+        type: 'GroupBy',
         settings: {
           groupByColumns: step.properties.groupByColumns || [],
           aggregations: step.properties.aggregations || [],
@@ -273,7 +329,7 @@ function mapStepToDomoAction(step, tileId, x, y) {
     case 'SORT':
       return {
         ...base,
-        type: 'SortAction',
+        type: 'Order',
         settings: {
           sortColumns: step.properties.sortColumns || [],
         },
@@ -302,18 +358,23 @@ function mapStepToDomoAction(step, tileId, x, y) {
     case 'JOIN_DATA':
       return {
         ...base,
-        type: 'JoinAction',
-        settings: {
-          joinType: step.properties.joinType || 'INNER',
-          leftKey: Array.isArray(step.properties.leftKey) ? step.properties.leftKey : [step.properties.leftKey || ''],
-          rightKey: Array.isArray(step.properties.rightKey) ? step.properties.rightKey : [step.properties.rightKey || ''],
-        },
+        type: 'MergeJoin',
+        settings: {},
+        joinType: step.properties.joinType === 'LEFT' ? 'LEFT OUTER'
+          : step.properties.joinType === 'INNER' ? 'INNER'
+            : step.properties.joinType === 'FULL' ? 'FULL OUTER'
+              : 'LEFT OUTER',
+        relationshipType: 'MANY_TO_MANY',
+        step1: base.dependsOn[0] || '',
+        step2: step.properties.rightDataset || '',
+        keys1: Array.isArray(step.properties.leftKey) ? step.properties.leftKey : [step.properties.leftKey || ''],
+        keys2: Array.isArray(step.properties.rightKey) ? step.properties.rightKey : [step.properties.rightKey || ''],
       };
 
     case 'APPEND_ROWS':
       return {
         ...base,
-        type: 'AppendAction',
+        type: 'UnionAll',
         settings: {
           datasetsToAppend: step.properties.datasetsToAppend || [],
         },
@@ -408,7 +469,7 @@ function mapStepToDomoAction(step, tileId, x, y) {
         },
       };
 
-    case 'NUMBER_FORMAT':
+    case 'NUMBER_FORMULA':
       return {
         ...base,
         type: 'NumberFormatAction',
@@ -464,6 +525,9 @@ function buildMagicEtlPayload(name, actions, inputs, outputs) {
 
 /**
  * Validates the payload before submission. Throws if invalid.
+ *
+ * @param {object} payload - The Magic ETL dataflow payload to validate
+ * @throws {Error} If validation fails
  */
 function validatePayload(payload) {
   const errors = [];
@@ -482,6 +546,16 @@ function validatePayload(payload) {
     }
   }
 
+  // Validate dependsOn references
+  const actionIdSet = new Set(payload.actions.map(a => a.id));
+  for (const action of payload.actions) {
+    for (const dep of (action.dependsOn || [])) {
+      if (!actionIdSet.has(dep)) {
+        errors.push(`Action '${action.id}' has dependsOn referencing unknown id '${dep}'`);
+      }
+    }
+  }
+
   if (errors.length > 0) {
     throw new Error(`[MAGIC ETL VALIDATION] Payload failed validation:\n  - ${errors.join('\n  - ')}`);
   }
@@ -496,12 +570,9 @@ function validatePayload(payload) {
  * @returns {{ dataflowId: string, dataflowUrl: string }} Created dataflow info
  */
 export async function createMagicEtlDataflow(dataflowDefinition) {
+  validateDomoEnv();
   const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
   const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-
-  if (!domain || !token) {
-    throw new Error('Domo domain or developer token environment variables are not set.');
-  }
 
   if (dataflowDefinition.skipped) {
     console.log(`[MAGIC ETL] Skipping table '${dataflowDefinition.tableName}': ${dataflowDefinition.skipReason}`);
@@ -509,7 +580,7 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
   }
 
   const headers = getAuthHeaders(token);
-  resetTileCounter();
+  const nextTileId = createTileIdGenerator();
 
   // ── 1. Input Tile (LoadFromVault) ──
   const inputTileId = nextTileId('input');
@@ -534,7 +605,7 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
     const tileId = nextTileId('transform');
     const x = xStart + i * xStep;
     const y = 100;
-    const domoAction = mapStepToDomoAction(step, tileId, x, y);
+    const domoAction = mapStepToDomoAction(step, tileId, x, y, previousTileId);
     actions.push(domoAction);
 
     if (domoAction.type === 'ManualAction') {
@@ -550,7 +621,7 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
   const outputTileId = nextTileId('output');
   const outputX = xStart + dataflowDefinition.steps.length * xStep;
   actions.push(
-    buildOutputAction(outputTileId, dataflowDefinition.outputDatasetName, outputX, 100)
+    buildOutputAction(outputTileId, dataflowDefinition.outputDatasetName, outputX, 100, previousTileId)
   );
 
   if (manualSteps.length > 0) {
@@ -654,12 +725,9 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
   }
 
   const promise = (async () => {
+    validateDomoEnv();
     const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
     const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-
-    if (!domain || !token) {
-      throw new Error('Domo domain or developer token environment variables are not set.');
-    }
 
     const validRels = resolvedRels.filter(r =>
       tableToDatasetId[r.fromTable] && tableToDatasetId[r.toTable]
@@ -677,7 +745,7 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
     const uniqueTables = Array.from(involvedTables);
 
     const headers = getAuthHeaders(token);
-    resetTileCounter();
+    const nextTileId = createTileIdGenerator();
 
     // ── 1. Input Tiles (LoadFromVault) ──
     const actions = [];
@@ -694,6 +762,8 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
         tableToColumns[tableName] = await fetchDatasetColumns(domain, token, tableToDatasetId[tableName]);
       })
     );
+
+
 
     // ── 2. Join Tiles (MergeJoin) ──
     const joinedTables = new Set();
@@ -724,6 +794,8 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
 
         let joinName;
         let rightTable;
+        let leftTableName;
+        let rightTableName;
         let leftKey;
         let rightKey;
 
@@ -736,6 +808,8 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
           (tableToColumns[fromTable] || []).forEach(c => accumulatedLeftCols.add(c));
 
           rightTable = toTable;
+          leftTableName = fromTable;
+          rightTableName = toTable;
           leftKey = rel.fromColumn;
           rightKey = rel.toColumn;
         } else {
@@ -743,12 +817,16 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
             joinName = `Join ${toTable} to Model`;
             joinedTables.add(toTable);
             rightTable = toTable;
+            leftTableName = fromTable;
+            rightTableName = toTable;
             leftKey = rel.fromColumn;
             rightKey = rel.toColumn;
           } else {
             joinName = `Join ${fromTable} to Model`;
             joinedTables.add(fromTable);
             rightTable = fromTable;
+            leftTableName = toTable;
+            rightTableName = fromTable;
             leftKey = rel.toColumn;
             rightKey = rel.fromColumn;
           }
@@ -769,9 +847,6 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
         const step1Id = isFirstJoin ? tableToTileId[fromTable] : activeStreamId;
         const step2Id = tableToTileId[rightTable];
 
-        const leftColsArray = Array.from(accumulatedLeftCols);
-        const rightColsArray = tableToColumns[rightTable] || [];
-
         actions.push(
           buildJoinAction(
             joinTileId,
@@ -782,20 +857,12 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
             jx,
             jy,
             step1Id,
-            step2Id,
-            leftColsArray,
-            rightColsArray
+            step2Id
           )
         );
 
-        const excludeColumns2 = getExcludeColumns(leftColsArray, rightColsArray, rightKey);
-        const excludedSet = new Set(excludeColumns2.map(c => c.toLowerCase()));
-
-        rightColsArray.forEach(c => {
-          if (!excludedSet.has(c.toLowerCase())) {
-            accumulatedLeftCols.add(c);
-          }
-        });
+        // Accumulate right table's prefixed columns
+        (tableToColumns[rightTable] || []).forEach(c => accumulatedLeftCols.add(c));
 
         activeStreamId = joinTileId;
         joinIndex++;
@@ -812,9 +879,6 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
         const leftKey = rel.fromColumn;
         const rightKey = rel.toColumn;
 
-        const leftColsSub = tableToColumns[fromTable] || [];
-        const rightColsSub = tableToColumns[toTable] || [];
-
         actions.push(
           buildJoinAction(
             subJoinTileId,
@@ -825,31 +889,22 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
             sjx,
             350,
             tableToTileId[fromTable],
-            tableToTileId[toTable],
-            leftColsSub,
-            rightColsSub
+            tableToTileId[toTable]
           )
         );
         joinIndex++;
 
-        // Compute sub-branch output columns
-        const excludeColumns2Sub = getExcludeColumns(leftColsSub, rightColsSub, rightKey);
-        const excludedSetSub = new Set(excludeColumns2Sub.map(c => c.toLowerCase()));
-
-        const subBranchCols = [...leftColsSub];
-        rightColsSub.forEach(c => {
-          if (!excludedSetSub.has(c.toLowerCase())) {
-            subBranchCols.push(c);
-          }
-        });
+        // Compute sub-branch output columns (no prefixing, no collisions)
+        const subBranchCols = [
+          ...(tableToColumns[fromTable] || []),
+          ...(tableToColumns[toTable] || [])
+        ];
 
         const mergeJoinTileId = nextTileId('join-merge');
         const mjx = joinXStart + joinIndex * joinXStep;
 
         const leftMergeKey = rel.fromColumn;
         const rightMergeKey = rel.fromColumn;
-
-        const leftColsMerge = Array.from(accumulatedLeftCols);
 
         actions.push(
           buildJoinAction(
@@ -861,21 +916,12 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
             mjx,
             250,
             activeStreamId,
-            subJoinTileId,
-            leftColsMerge,
-            subBranchCols
+            subJoinTileId
           )
         );
 
-        // Update accumulatedLeftCols with sub-branch columns after excluding right keys & duplicate columns
-        const excludeColumns2Merge = getExcludeColumns(leftColsMerge, subBranchCols, rightMergeKey);
-        const excludedSetMerge = new Set(excludeColumns2Merge.map(c => c.toLowerCase()));
-
-        subBranchCols.forEach(c => {
-          if (!excludedSetMerge.has(c.toLowerCase())) {
-            accumulatedLeftCols.add(c);
-          }
-        });
+        // Accumulate sub-branch columns
+        subBranchCols.forEach(c => accumulatedLeftCols.add(c));
 
         joinedTables.add(fromTable);
         joinedTables.add(toTable);

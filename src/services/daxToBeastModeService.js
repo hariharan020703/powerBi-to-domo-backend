@@ -320,29 +320,73 @@ Before producing output, verify ALL of the following:
 ✓ No DAX & operator remains — must be CONCAT()
 ✓ No FORMAT() calls remain — use ROUND() for numbers, DATE_FORMAT() for dates
 ✓ No VALUES() calls remain — approximate with MAX()
+✓ No column names wrapped in single quotes — columns must use backticks, never 'col' — only string VALUES use single quotes
 
 ═══════════════════════════════════════════════════════
 RULE 12 — CALCULATE(COUNT) INSIDE DIVIDE DENOMINATOR (CRITICAL)
 ═══════════════════════════════════════════════════════
 When CALCULATE(COUNT(col), filters) appears as the denominator of DIVIDE(),
-do NOT convert it to COUNT(CASE WHEN ... END). Domo rejects COUNT(CASE WHEN)
-inside a division with HTTP 500.
+the ONLY valid Beast Mode pattern is:
 
-Instead, convert it to SUM(CASE WHEN filters THEN 1 ELSE 0 END).
+  SUM(\`numerator_col\`) / NULLIF(COUNT(CASE WHEN filter_conditions THEN \`col\` END), 0)
+
+COLUMN REFERENCES in the CASE WHEN must use backticks — NEVER single quotes.
+  ✓ CORRECT: COUNT(CASE WHEN \`PO_COST\` IS NOT NULL AND \`PO_COST\` > 0 THEN \`PO_COST\` END)
+  ✗ WRONG:   COUNT(CASE WHEN 'PO_COST' IS NOT NULL AND 'PO_COST' > 0 THEN 'PO_COST' END)
+
+ABSOLUTE BANS — Domo rejects ALL of these with HTTP 400/500:
+  ✗ CASE WHEN SUM(CASE WHEN...) = 0 THEN NULL ELSE ... END   [nested aggregate in zero-guard]
+  ✗ SUM(\`col\`) / SUM(CASE WHEN ... THEN 1 ELSE 0 END)        [nested aggregate]
+  ✗ Any CASE WHEN wrapping a conditional aggregate as the zero-guard
 
 Example:
   DAX: DIVIDE(SUM('T'[PO_COST]), CALCULATE(COUNT('T'[Ser_Num]), NOT ISBLANK('T'[PO_COST]), 'T'[PO_COST] > 0))
-  →   CASE WHEN SUM(CASE WHEN \`PO_COST\` IS NOT NULL AND \`PO_COST\` > 0 THEN 1 ELSE 0 END) = 0
-           THEN NULL
-           ELSE SUM(\`PO_COST\`) / SUM(CASE WHEN \`PO_COST\` IS NOT NULL AND \`PO_COST\` > 0 THEN 1 ELSE 0 END)
-       END
+  → SUM(\`PO_COST\`) / NULLIF(COUNT(CASE WHEN \`PO_COST\` IS NOT NULL AND \`PO_COST\` > 0 THEN \`PO_COST\` END), 0)
 
 General pattern:
-  DIVIDE(numerator, CALCULATE(COUNT(col), filter1, filter2))
-  → CASE WHEN SUM(CASE WHEN filter1 AND filter2 THEN 1 ELSE 0 END) = 0
-         THEN NULL
-         ELSE (numerator) / SUM(CASE WHEN filter1 AND filter2 THEN 1 ELSE 0 END)
-     END
+  DIVIDE(SUM(col_a), CALCULATE(COUNT(col_b), filter1, filter2))
+  → SUM(\`col_a\`) / NULLIF(COUNT(CASE WHEN filter1_cond AND filter2_cond THEN \`col_b\` END), 0)
+
+═══════════════════════════════════════════════════════
+RULE 12A — HARD BAN ON SUM(CASE ... THEN 1 ELSE 0 END) FOR AVERAGE / DIVIDE DENOMINATORS
+═══════════════════════════════════════════════════════
+
+When converting a DAX formula of the form:
+
+  DIVIDE(SUM(numerator_col), CALCULATE(COUNT(count_col), filters...))
+
+or any "average cost / average per request / total divided by filtered row count" pattern,
+
+NEVER generate either of these:
+
+  CASE WHEN SUM(CASE WHEN condition THEN 1 ELSE 0 END) = 0 THEN ...
+  SUM(numerator_col) / SUM(CASE WHEN condition THEN 1 ELSE 0 END)
+
+These patterns are INVALID for Domo Beast Mode and must NEVER appear.
+
+ALWAYS generate this exact pattern instead:
+
+  SUM(\`numerator_col\`) / NULLIF(COUNT(CASE WHEN filter_conditions THEN \`count_col\` END), 0)
+
+If the counted column is unavailable or ambiguous, use the filtered numeric numerator column itself as the count target:
+
+  SUM(\`numerator_col\`) / NULLIF(COUNT(CASE WHEN filter_conditions THEN \`numerator_col\` END), 0)
+
+ABSOLUTE BAN:
+- No CASE WHEN zero-guard around SUM(CASE WHEN ... THEN 1 ELSE 0 END)
+- No SUM(CASE WHEN ... THEN 1 ELSE 0 END) as a denominator
+- No CASE WHEN COUNT(...) = 0 THEN ... END for this pattern
+- Use NULLIF(COUNT(...), 0) directly
+
+Example:
+DAX:
+DIVIDE(
+  SUM('Table'[PO_COST]),
+  CALCULATE(COUNT('Table'[Ser_Num]), NOT ISBLANK('Table'[PO_COST]), 'Table'[PO_COST] > 0)
+)
+
+Beast Mode:
+SUM(\`PO_COST\`) / NULLIF(COUNT(CASE WHEN \`PO_COST\` IS NOT NULL AND \`PO_COST\` > 0 THEN \`Ser_Num\` END), 0)
 
 ═══════════════════════════════════════════════════════
 RULE 13 — STRING CONCATENATION, NUMERIC FORMAT, AND VALUES (CRITICAL)
@@ -415,8 +459,8 @@ EXAMPLES
 10. DAX: IF(ISBLANK(SUM('Table'[Cost])), 0, SUM('Table'[Cost]))
     → IFNULL(SUM(\`Cost\`), 0)
 
-11. DAX: DIVIDE(SUM('Table'[PO_COST]), CALCULATE(COUNT('Table'[Ser_Num]), NOT ISBLANK('Table'[PO_COST]), 'Table'[PO_COST] > 0))
-    → CASE WHEN SUM(CASE WHEN \`PO_COST\` IS NOT NULL AND \`PO_COST\` > 0 THEN 1 ELSE 0 END) = 0 THEN NULL ELSE SUM(\`PO_COST\`) / SUM(CASE WHEN \`PO_COST\` IS NOT NULL AND \`PO_COST\` > 0 THEN 1 ELSE 0 END) END
+11.DAX: DIVIDE(SUM('Table'[PO_COST]), CALCULATE(COUNT('Table'[Ser_Num]), NOT ISBLANK('Table'[PO_COST]), 'Table'[PO_COST] > 0))
+    → SUM(\`PO_COST\`) / NULLIF(COUNT(CASE WHEN \`PO_COST\` IS NOT NULL AND \`PO_COST\` > 0 THEN \`Ser_Num\` END), 0)
 
 12. DAX: " (" & FORMAT([Completed_%], "0.0") & "%)"   [where Completed_% is already substituted as a Beast Mode formula]
     → CONCAT(CONCAT(' (', ROUND((substituted_formula), 1)), '%)')
@@ -491,6 +535,17 @@ export async function convertWithValidation({ measureName, daxExpression, availa
       if (formula === 'UNSUPPORTED') {
         console.log(`[DAX MIGRATION] Measure '${measureName}' returned UNSUPPORTED by LLM.`);
         return { status: 'unsupported', measureName };
+      }
+
+      const normalized = formula.replace(/\s+/g, ' ').trim();
+      const hasNestedSumCase =
+        normalized.includes('CASE WHEN SUM(CASE WHEN') &&
+        normalized.includes('THEN 1 ELSE 0 END)');
+
+      if (hasNestedSumCase) {
+        lastError = 'Formula contains nested SUM(CASE WHEN...THEN 1 ELSE 0 END) pattern which Domo rejects with HTTP 400. Use SUM(`col`) / NULLIF(COUNT(CASE WHEN filter THEN `col` END), 0) instead.';
+        console.warn(`[DAX MIGRATION] Attempt ${attempt}/${maxAttempts} for '${measureName}' contains invalid nested aggregate pattern — forcing retry.`);
+        continue;
       }
 
       const validation = validateBeastModeFormula(formula, availableColumns);

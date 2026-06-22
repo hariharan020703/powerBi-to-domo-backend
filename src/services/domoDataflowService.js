@@ -8,6 +8,49 @@ function getAuthHeaders(token) {
 }
 
 /**
+ * Validates that required Domo environment variables are set.
+ * Throws if any are missing.
+ */
+function validateDomoEnv() {
+  const missing = ['DOMO_CLIENT_DOMAIN', 'DOMO_CLIENT_TOKEN'].filter(
+    k => !process.env[k]?.trim()
+  );
+  if (missing.length > 0) {
+    throw new Error(`Missing required Domo environment variables: ${missing.join(', ')}`);
+  }
+}
+
+/**
+ * Executes an HTTP request function with retry logic and exponential backoff.
+ * Retries on network errors, rate limiting (429), and server errors (>= 500).
+ *
+ * @param {function} requestFn - Async function that performs the HTTP request
+ * @param {number} maxRetries - Maximum number of retry attempts
+ * @returns {Promise<*>} The result of the request function
+ */
+async function requestWithRetry(requestFn, maxRetries = 5) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await requestFn();
+    } catch (error) {
+      attempt++;
+      const status = error.response ? error.response.status : null;
+      const isRetryable = !status || status === 429 || status >= 500;
+
+      if (attempt > maxRetries || !isRetryable) {
+        throw error;
+      }
+
+      // Exponential backoff: 2s, 4s, 8s...
+      const backoffDelay = 2000 * Math.pow(2, attempt);
+      console.warn(`[DATAFLOW SERVICE] Request failed (${error.message}). Retrying in ${backoffDelay}ms (Attempt ${attempt}/${maxRetries})...`);
+      await new Promise(resolve => setTimeout(resolve, backoffDelay));
+    }
+  }
+}
+
+/**
  * Resolves raw relationship rows into human-readable join definitions
  * using table and column metadata.
  *
@@ -61,18 +104,21 @@ export function resolveRelationships(relationships) {
 }
 
 export async function fetchDomoDatasetSchema(domain, token, datasetId) {
-  try {
-    const headers = getAuthHeaders(token);
-    const url = `https://${domain}/api/query/v1/datasources/${datasetId}/schema/indexed?includeHidden=false`;
-    console.log(`[DATA MODEL] Fetching schema: ${url}`);
-    const response = await axios.get(url, { headers, timeout: 30000 });
-    const columns = response.data?.tables?.[0]?.columns || [];
-    console.log(`[DATA MODEL] Schema fetched for ${datasetId}: ${columns.length} columns`);
-    return columns;
-  } catch (err) {
-    console.error(`[DATA MODEL] Schema fetch FAILED for ${datasetId}: HTTP ${err.response?.status} - ${err.message}`);
-    return null;
-  }
+  validateDomoEnv();
+  return requestWithRetry(async () => {
+    try {
+      const headers = getAuthHeaders(token);
+      const url = `https://${domain}/api/query/v1/datasources/${datasetId}/schema/indexed?includeHidden=false`;
+      console.log(`[DATA MODEL] Fetching schema: ${url}`);
+      const response = await axios.get(url, { headers, timeout: 30000 });
+      const columns = response.data?.tables?.[0]?.columns || [];
+      console.log(`[DATA MODEL] Schema fetched for ${datasetId}: ${columns.length} columns`);
+      return columns;
+    } catch (err) {
+      console.error(`[DATA MODEL] Schema fetch FAILED for ${datasetId}: HTTP ${err.response?.status} - ${err.message}`);
+      return null;
+    }
+  });
 }
 
 /**
@@ -80,12 +126,9 @@ export async function fetchDomoDatasetSchema(domain, token, datasetId) {
  * This mirrors Power BI's Model View — linking datasets via join columns.
  */
 export async function createDomoDataModel(modelName, resolvedRels, tableToDatasetId, tableToColumns = {}) {
+  validateDomoEnv();
   const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
   const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-
-  if (!domain || !token) {
-    throw new Error('Domo domain or developer token environment variables are not set.');
-  }
 
   const headers = getAuthHeaders(token);
 
@@ -226,30 +269,32 @@ export async function createDomoDataModel(modelName, resolvedRels, tableToDatase
   console.log(`[DATA MODEL] Tables: ${Object.keys(objects).length}, Relationships: ${relationships.length}`);
   console.log(`[DATA MODEL] Full payload:`, JSON.stringify(payload, null, 2));
 
-  try {
-    const response = await axios.post(
-      `https://${domain}/api/query/v1/semantic-models`,
-      payload,
-      { headers, timeout: 60000 }
-    );
+  return requestWithRetry(async () => {
+    try {
+      const response = await axios.post(
+        `https://${domain}/api/query/v1/semantic-models`,
+        payload,
+        { headers, timeout: 60000 }
+      );
 
-    // Response has dataSourceId at root level
-    const modelId = response.data?.dataSourceId || response.data?.id;
-    if (!modelId) {
-      throw new Error(`No ID in response: ${JSON.stringify(response.data)}`);
+      // Response has dataSourceId at root level
+      const modelId = response.data?.dataSourceId || response.data?.id;
+      if (!modelId) {
+        throw new Error(`No ID in response: ${JSON.stringify(response.data)}`);
+      }
+
+      console.log(`[DATA MODEL] Created successfully. ID: ${modelId}`);
+      return {
+        modelId,
+        modelUrl: `https://${domain}/datamodels/${modelId}`,
+        joinCount: relationships.length,
+        resolvedRelationships: dedupedRels,
+      };
+
+    } catch (error) {
+      const status = error.response?.status ?? 'N/A';
+      const body = error.response ? JSON.stringify(error.response.data) : error.message;
+      throw new Error(`Failed to create Domo semantic model: HTTP ${status} - ${body}`);
     }
-
-    console.log(`[DATA MODEL] Created successfully. ID: ${modelId}`);
-    return {
-      modelId,
-      modelUrl: `https://${domain}/datamodels/${modelId}`,
-      joinCount: relationships.length,
-      resolvedRelationships: dedupedRels,
-    };
-
-  } catch (error) {
-    const status = error.response?.status ?? 'N/A';
-    const body = error.response ? JSON.stringify(error.response.data) : error.message;
-    throw new Error(`Failed to create Domo semantic model: HTTP ${status} - ${body}`);
-  }
+  });
 }

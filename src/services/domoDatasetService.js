@@ -48,6 +48,19 @@ function getHeaders(token) {
 }
 
 /**
+ * Validates that required Domo environment variables are set.
+ * Throws if any are missing.
+ */
+function validateDomoEnv() {
+  const missing = ['DOMO_CLIENT_DOMAIN', 'DOMO_CLIENT_TOKEN'].filter(
+    k => !process.env[k]?.trim()
+  );
+  if (missing.length > 0) {
+    throw new Error(`Missing required Domo environment variables: ${missing.join(', ')}`);
+  }
+}
+
+/**
  * Executes an HTTP request function with retry logic and exponential backoff.
  * Retries on network errors, rate limiting (429), and server errors (>= 500).
  */
@@ -78,12 +91,9 @@ async function requestWithRetry(requestFn, maxRetries = 5) {
  * Body contains: { name: tableName, schema: { columns } }
  */
 export async function createDomoDataset(tableName, columns) {
+  validateDomoEnv();
   const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
   const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-
-  if (!domain || !token) {
-    throw new Error('Domo domain or developer token environment variables are not set.');
-  }
 
   const headers = getHeaders(token);
 
@@ -161,12 +171,9 @@ async function pollUntilReady(domain, authHeaders, domoDatasetId, maxAttempts = 
  * https://{DOMO_CLIENT_DOMAIN}/api/data/v3/datasources/{domoDatasetId}/data/import
  */
 export async function uploadDataToDomoDataset(domoDatasetId, columns, rows) {
+  validateDomoEnv();
   const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
   const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-
-  if (!domain || !token) {
-    throw new Error('Domo domain or developer token environment variables are not set.');
-  }
 
   const escape = (v) => {
     const s = v === null || v === undefined ? '' : String(v);

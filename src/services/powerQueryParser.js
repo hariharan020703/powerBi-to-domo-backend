@@ -277,7 +277,7 @@ function extractGroupByDetails(expr) {
       const colMatch = aggExpr.match(/\[([^\]]+)\]/);
       if (colMatch) col = colMatch[1];
 
-      aggregations.push({ col, func });
+      aggregations.push({ outputColName: aggName, aggregationFunction: func, sourceCol: col });
     }
   }
 
@@ -486,8 +486,8 @@ export function parsePowerQuerySteps(mExpression) {
 
     let step = null;
 
-    // ── FILTER: Table.SelectRows ──
-    if (/Table\.SelectRows/i.test(expr)) {
+    // ── FILTER: Table.SelectRows / Table.Filter ──
+    if (/Table\.SelectRows/i.test(expr) || /Table\.Filter/i.test(expr)) {
       const condition = extractFilterCondition(expr);
       step = {
         stepName,
@@ -558,7 +558,7 @@ export function parsePowerQuerySteps(mExpression) {
     // ── GROUP_BY: Table.Group ──
     else if (/Table\.Group/i.test(expr)) {
       const { groupByColumns, aggregations } = extractGroupByDetails(expr);
-      const desc = `Group by [${groupByColumns.join(', ')}] with ${aggregations.map(a => `${a.func}(${a.col})`).join(', ')}`;
+      const desc = `Group by [${groupByColumns.join(', ')}] with ${aggregations.map(a => `${a.aggregationFunction}(${a.sourceCol})`).join(', ')}`;
       step = {
         stepName,
         actionType: 'GROUP_BY',
@@ -767,12 +767,12 @@ export function parsePowerQuerySteps(mExpression) {
       };
     }
 
-    // ── NUMBER_FORMAT: Table.TransformColumns with Number.* ──
+    // ── NUMBER_FORMULA: Table.TransformColumns with Number.* ──
     else if (/Table\.TransformColumns/i.test(expr) && /Number\./i.test(expr)) {
       const colMatch = expr.match(/"([^"]+)"\s*,\s*Number\.(\w+)/i);
       step = {
         stepName,
-        actionType: 'NUMBER_FORMAT',
+        actionType: 'NUMBER_FORMULA',
         description: `Apply Number.${colMatch?.[2] || 'Round'} to column '${colMatch?.[1] || ''}'`,
         properties: {
           columnName: colMatch?.[1] || '',
@@ -813,7 +813,7 @@ export function parsePowerQuerySteps(mExpression) {
         } else if (addColResult.actionType === 'NUMBER_FORMAT') {
           step = {
             stepName,
-            actionType: 'NUMBER_FORMAT',
+            actionType: 'NUMBER_FORMULA',
             description: `Add number column '${addColResult.columnName}' — ${addColResult.operation}(${addColResult.sourceColumn})`,
             properties: {
               columnName: addColResult.columnName,
@@ -945,15 +945,13 @@ export function parsePowerQuerySteps(mExpression) {
  * @returns {object} Dataflow definition matching the output schema
  */
 export function buildDataflowDefinition(reportName, tableName, domoInputDatasetId, steps) {
-  const hasSteps = steps.length > 0;
-
   return {
-    dataflowName: `${reportName} — ${tableName} (Magic ETL)`,
+    dataflowName: `${reportName} - ${tableName} (Magic ETL)`,
     tableName,
     domoInputDatasetId,
-    outputDatasetName: `${tableName}_transformed`,
-    steps,
-    skipped: !hasSteps,
-    skipReason: hasSteps ? null : 'No meaningful transformations found — table is a direct source reference.'
+    outputDatasetName: `${reportName} - ${tableName} Output`,
+    steps: steps || [],
+    skipped: !steps || steps.length === 0,
+    skipReason: !steps || steps.length === 0 ? 'No parseable M Query steps found' : null,
   };
 }
