@@ -126,6 +126,7 @@ function buildOutputAction(id, name, x, y, dependsOnId) {
     type: 'PublishToVault',
     id,
     name,
+    dataSourceName: name,  // ADD THIS — must match outputs array entry
     dependsOn: [dependsOnId],
     settings: {},
     gui: { x, y },
@@ -285,11 +286,13 @@ function mapStepToDomoAction(step, tileId, x, y, previousTileId) {
     case 'SET_COLUMN_TYPE':
       return {
         ...base,
-        type: 'SelectValues',
-        fields: (step.properties.columns || []).map(c => ({
-          name: c.name,
-          type: mapMTypeToEtlType(c.toType)
-        })),
+        type: 'Metadata',
+        fields: (step.properties.columns || [])
+          .filter(c => c.name && c.name.trim().length > 0)
+          .map(c => ({
+            name: c.name,
+            type: mapMTypeToEtlType(c.toType)
+          })),
         removeByDefault: false,
       };
 
@@ -518,8 +521,8 @@ function buildMagicEtlPayload(name, actions, inputs, outputs) {
     magic: true,
     editable: true,
     actions,
-    inputs: [],
-    outputs: []
+    inputs,
+    outputs
   };
 }
 
@@ -632,14 +635,18 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
   // ── 4. Build inputs / outputs arrays ──
   const inputs = [
     {
-      datasetId: dataflowDefinition.domoInputDatasetId,
-      datasetName: dataflowDefinition.tableName,
+      dataSourceId: dataflowDefinition.domoInputDatasetId,
+      dataSourceName: dataflowDefinition.tableName,
+      executeFlowWhenUpdated: false,
+      onlyLoadNewVersions: false,
+      recentVersionCutoffMs: 0
     }
   ];
 
   const outputs = [
     {
-      datasetName: dataflowDefinition.outputDatasetName,
+      dataSourceName: dataflowDefinition.outputDatasetName,
+      versionChainType: 'REPLACE'
     }
   ];
 
@@ -977,8 +984,6 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
       const response = await axios.post(url, payload, { headers, timeout: 60000 });
 
       const dataflowId = response.data?.id || response.data?.dataFlowId || response.data?.dataflowId;
-      const respOutputs = response.data?.outputs || [];
-      const outputDatasetId = respOutputs[0]?.dataSourceId || respOutputs[0]?.id || respOutputs[0]?.datasetId || null;
 
       if (!dataflowId) {
         console.warn(`[MAGIC ETL MODEL VIEW] Dataflow may have been created but no ID in response:`, JSON.stringify(response.data));
@@ -990,8 +995,26 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
         };
       }
 
+      // Run and poll the dataflow
+      console.log(`[MAGIC ETL MODEL VIEW] Running and polling dataflow ${dataflowId}...`);
+      const { executionId } = await runMagicEtlDataflow(dataflowId);
+      const execResult = await pollEtlExecution(dataflowId, executionId);
+      if (!execResult.succeeded) {
+        throw new Error(`Model View ETL execution failed: ${execResult.error}`);
+      }
+
+      // Fetch details to extract outputDatasetId
+      const detailUrl = `https://${domain}/api/dataprocessing/v1/dataflows/${dataflowId}`;
+      const detailResponse = await axios.get(detailUrl, { headers, timeout: 30000 });
+      const respOutputs = detailResponse.data?.outputs || [];
+      const outputDatasetId =
+        respOutputs[0]?.dataSourceId ||
+        respOutputs[0]?.id ||
+        respOutputs[0]?.datasetId ||
+        null;
+
       const dataflowUrl = `https://${domain}/datacenter/dataflows/${dataflowId}`;
-      console.log(`[MAGIC ETL MODEL VIEW] Created successfully. ID: ${dataflowId}, URL: ${dataflowUrl}, Output Dataset: ${outputDatasetId}`);
+      console.log(`[MAGIC ETL MODEL VIEW] Created and ran successfully. ID: ${dataflowId}, URL: ${dataflowUrl}, Output Dataset: ${outputDatasetId}`);
 
       return {
         dataflowId,
@@ -1015,4 +1038,81 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
   } finally {
     _modelViewInFlight.delete(reportName);
   }
+}
+
+/**
+ * Triggers execution of a Magic ETL dataflow in Domo.
+ *
+ * @param {string} dataflowId - The ID of the dataflow to run
+ * @returns {Promise<{ executionId: string }>} Triggered execution ID
+ */
+export async function runMagicEtlDataflow(dataflowId) {
+  validateDomoEnv();
+  const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+  const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+
+  const headers = getAuthHeaders(token);
+  const url = `https://${domain}/api/dataprocessing/v1/dataflows/${dataflowId}/executions`;
+
+  console.log(`[MAGIC ETL RUN] Triggering execution for dataflow ${dataflowId} via: ${url}`);
+
+  return requestWithRetry(async () => {
+    const response = await axios.post(url, {}, { headers, timeout: 30000 });
+    const executionId = response.data?.id || response.data?.executionId;
+    console.log(`[MAGIC ETL RUN] Execution triggered successfully. Execution ID: ${executionId}`);
+    return { executionId };
+  });
+}
+
+/**
+ * Polls the execution status of a Magic ETL dataflow in Domo until completion.
+ *
+ * @param {string} dataflowId - The ID of the dataflow
+ * @param {string} executionId - The ID of the execution to monitor
+ * @param {number} maxWaitTimeMs - Maximum time to wait in milliseconds
+ * @returns {Promise<{ succeeded: boolean, status: string, error?: string }>} Execution result
+ */
+export async function pollEtlExecution(dataflowId, executionId, maxWaitTimeMs = 300000) {
+  validateDomoEnv();
+  const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+  const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+
+  const headers = getAuthHeaders(token);
+  const url = `https://${domain}/api/dataprocessing/v1/dataflows/${dataflowId}/executions/${executionId}`;
+
+  console.log(`[MAGIC ETL POLL] Polling execution status for dataflow ${dataflowId}, execution ${executionId}`);
+
+  const startTime = Date.now();
+  const interval = 5000; // Poll every 5 seconds
+
+  while (Date.now() - startTime < maxWaitTimeMs) {
+    try {
+      const response = await axios.get(url, { headers, timeout: 15000 });
+      const data = response.data;
+
+      const state = (data?.state || data?.status || '').toUpperCase();
+      console.log(`[MAGIC ETL POLL] Execution ${executionId} state: ${state}`);
+
+      if (state === 'SUCCESS' || state === 'SUCCEEDED') {
+        return { succeeded: true, status: state };
+      }
+
+      if (state === 'FAILED' || state === 'FAILURE' || state === 'ERROR') {
+        const errorMsg = data?.message || data?.statusReason || 'Execution failed';
+        return { succeeded: false, status: state, error: errorMsg };
+      }
+
+      if (state === 'CANCELLED' || state === 'CANCELED') {
+        return { succeeded: false, status: state, error: 'Execution was cancelled' };
+      }
+
+    } catch (err) {
+      console.error(`[MAGIC ETL POLL] Error fetching execution status: ${err.message}`);
+      // Do not throw or terminate polling on transient HTTP failures, retry next time
+    }
+
+    await new Promise(resolve => setTimeout(resolve, interval));
+  }
+
+  return { succeeded: false, status: 'TIMEOUT', error: 'Execution polling timed out' };
 }

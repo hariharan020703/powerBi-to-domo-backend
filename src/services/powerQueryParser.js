@@ -6,7 +6,7 @@ function extractLetSteps(mExpression) {
   const trimmed = mExpression.trim();
 
   // Match `let ... in <finalStep>`
-  const letMatch = trimmed.match(/^let\s+([\s\S]+?)\s+in\s+\S+\s*$/i);
+  const letMatch = trimmed.match(/^let\s+([\s\S]+?)\s+in\s+(?:#"[^"]*"|\S+)\s*$/i);
   if (!letMatch) {
     // Not a standard let/in expression — treat entire thing as one step
     return [];
@@ -128,7 +128,9 @@ function extractListItems(listStr) {
   }
   if (current.trim()) items.push(current.trim());
 
-  return items.map(item => item.replace(/^"/, '').replace(/"$/, '').trim());
+  return items
+    .map(item => item.replace(/^"/, '').replace(/"$/, '').trim())
+    .filter(item => item.length > 0 && item.toLowerCase() !== 'null');
 }
 
 /**
@@ -149,8 +151,8 @@ function extractRenamePairs(expr) {
  */
 function extractTypeChanges(expr) {
   const columns = [];
-  // Match patterns like {"Column Name", type number} or {"Column", Int64.Type}
-  const typeRegex = /\{\s*"([^"]+)"\s*,\s*(type\s+\w+|Int64\.Type|Currency\.Type|Percentage\.Type|[\w.]+)\s*\}/gi;
+  // Primary regex — handles standard and multi-line formats
+  const typeRegex = /\{\s*"([^"]+)"\s*,\s*(type\s+\w+|Int64\.Type|Currency\.Type|Percentage\.Type|[\w.]+Type)\s*\}/gi;
   let match;
   while ((match = typeRegex.exec(expr)) !== null) {
     const name = match[1];
@@ -324,7 +326,7 @@ function classifyAddColumn(expr) {
 
   // Check for date operations
   if (/Date\.(Year|Month|Day|DayOfWeek|DayOfYear|AddDays|AddMonths|AddYears|From)/i.test(calcExpr)
-      || /Duration\./i.test(calcExpr)) {
+    || /Duration\./i.test(calcExpr)) {
     let operation = 'YEAR';
     if (/Date\.Month/i.test(calcExpr)) operation = 'MONTH';
     else if (/Date\.Day(?:OfWeek|OfYear)?/i.test(calcExpr)) operation = 'DAY';
@@ -450,11 +452,16 @@ function extractJoinDetails(expr) {
  */
 export function parsePowerQuerySteps(mExpression) {
   if (!mExpression || typeof mExpression !== 'string') {
+    console.warn('[POWER QUERY PARSER] mExpression is null or not a string — skipping');
     return [];
   }
 
   const rawSteps = extractLetSteps(mExpression);
+  console.log(`[POWER QUERY PARSER] extractLetSteps returned ${rawSteps.length} raw steps`);
+
   if (rawSteps.length === 0) {
+    console.warn('[POWER QUERY PARSER] No steps extracted — expression may not match let...in pattern or is a single-line expression');
+    console.warn('[POWER QUERY PARSER] First 300 chars:', mExpression.substring(0, 300));
     return [];
   }
 
@@ -903,7 +910,8 @@ export function parsePowerQuerySteps(mExpression) {
       step = {
         stepName,
         actionType: 'MANUAL_BUILD',
-        description: `Expand nested column '${expandColMatch?.[1] || ''}' — extract fields [${expandedCols.join(', ')}]. Build manually in Domo using joins or flattening logic.`,
+        description: `Expand nested column '${expandColMatch?.[1] || ''}' — extract fields [${expandedCols.length > 0 ? expandedCols.join(', ') : 'unknown — check source'
+          }]. Build manually in Domo using joins or flattening logic.`,
         properties: {
           description: `Expand column '${expandColMatch?.[1] || ''}' with fields: ${expandedCols.join(', ')}`
         }

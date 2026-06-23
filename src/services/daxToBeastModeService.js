@@ -13,6 +13,8 @@ const anthropic = new Anthropic({
   apiKey: env.anthropicApiKey
 });
 
+let _anthropicCreditExhausted = false;
+
 const SYSTEM_PROMPT = `You are an expert Power BI DAX to Domo Beast Mode formula converter. Your job is to ALWAYS produce a valid Beast Mode formula — never give up. Beast Mode formulas are MySQL-like SQL expressions evaluated row-by-row before aggregation.
 
 ═══════════════════════════════════════════════════════
@@ -521,6 +523,9 @@ Convert this DAX measure into a Domo Beast Mode formula.`;
  * @returns {Promise<{ status: string, measureName: string, formula?: string, error?: string }>}
  */
 export async function convertWithValidation({ measureName, daxExpression, availableColumns }, maxAttempts = 3) {
+  if (_anthropicCreditExhausted) {
+    return { status: 'needs_manual_review', measureName, error: 'Anthropic API credit exhausted — skipped' };
+  }
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -563,6 +568,17 @@ export async function convertWithValidation({ measureName, daxExpression, availa
       console.warn(
         `[DAX MIGRATION] Attempt ${attempt}/${maxAttempts} for '${measureName}' failed with API error: ${apiError.message}`
       );
+      // Detect non-retryable billing error and fail fast
+      if (
+        apiError?.status === 400 &&
+        (apiError?.message?.includes('credit balance is too low') ||
+         apiError?.error?.message?.includes('credit balance is too low') ||
+         String(apiError)?.includes('credit balance is too low'))
+      ) {
+        console.warn(`[DAX MIGRATION] Anthropic credit exhausted — skipping all remaining LLM conversions`);
+        _anthropicCreditExhausted = true;
+        throw apiError; // don't retry
+      }
     }
   }
 
