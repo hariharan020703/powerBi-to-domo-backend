@@ -1,16 +1,3 @@
-/**
- * Beast Mode Compatibility Map & Validation
- *
- * Static reference module encoding:
- * - Beast Mode supported function whitelist
- * - DAX construct blocklists (ETL / MANUAL_BUILD triggers)
- * - Measure classification (DIRECT_BEASTMODE | ETL_PREAGGREGATION | MANUAL_BUILD)
- * - Post-conversion formula validation
- * - Data type inference, aggregation detection, column extraction
- */
-
-// ─── Beast Mode Supported Functions (Whitelist) ────────────────────────────────
-
 export const BEAST_MODE_FUNCTIONS = {
   aggregate: [
     'SUM', 'AVG', 'COUNT', 'MIN', 'MAX',
@@ -654,16 +641,39 @@ export function substituteDependencies(expression, convertedFormulasMap) {
 export function sanitizeBeastModeFormula(formula) {
   if (!formula || typeof formula !== 'string') return formula;
   let f = formula;
-  // Remove DAX line comments
+ 
   f = f.replace(/--[^\n]*/g, ' ');
-  // Remove DAX block comments
   f = f.replace(/\/\*[\s\S]*?\*\//g, ' ');
-  // Collapse newlines and extra spaces
   f = f.replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
-  // Replace double-quoted string literals with single quotes
   f = f.replace(/"([^"]*)"/g, "'$1'");
-  // Remove DAX & concatenation operator that leaked through
-  f = f.replace(/'\s*&\s*'/g, "', '");
+ 
+  // ── & Concatenation Fix ──────────────────────────────────────────────────
+
+  let maxPasses = 10;
+  while (f.includes('&') && maxPasses-- > 0) {
+    // Pattern 1: expr) & 'string'  →  wrap both in CONCAT
+    f = f.replace(/([^&']+(?:\([^)]*\))*[^&']*?)\s*&\s*'([^']*)'/g,
+      (_, left, right) => `CONCAT(${left.trim()}, '${right}')`
+    );
+ 
+    // Pattern 2: 'string' & expr  →  wrap both in CONCAT
+    f = f.replace(/'([^']*)'\s*&\s*([^&',()\n][^&\n]*)/g,
+      (_, left, right) => `CONCAT('${left}', ${right.trim()})`
+    );
+ 
+    // Pattern 3: CONCAT(...) & expr  →  nest into outer CONCAT
+    f = f.replace(/(CONCAT\([^)]+\))\s*&\s*'([^']*)'/g,
+      (_, left, right) => `CONCAT(${left}, '${right}')`
+    );
+ 
+    f = f.replace(/([^&\n]+?)\s*&\s*(CONCAT\([^)]+\))/g,
+      (_, left, right) => `CONCAT(${left.trim()}, ${right})`
+    );
+ 
+    f = f.replace(/([^&\n]+?)\s*&\s*([^&\n]+)/g,
+      (_, left, right) => `CONCAT(${left.trim()}, ${right.trim()})`
+    );
+  }
+ 
   return f;
 }
-

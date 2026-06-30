@@ -12,16 +12,16 @@ const requiredEnvVars = [
   'AZURE_TENANT_ID',
   'AZURE_CLIENT_ID',
   'AZURE_CLIENT_SECRET',
-  'ANTHROPIC_API_KEY',
   'DOMO_CLIENT_DOMAIN',
-  'DOMO_CLIENT_TOKEN'
+  'DOMO_CLIENT_TOKEN',
+  'GROQ_API_KEY'
 ];
 
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 
 if (missingVars.length > 0) {
   console.error(`[CONFIG ERROR] Missing required environment variables: ${missingVars.join(', ')}`);
-  console.error('Please configure your .env file with the necessary Azure AD, Anthropic, and Domo details.');
+  console.error('Please configure your .env file with the necessary Azure AD and Domo details.');
   if (process.env.NODE_ENV === 'production') {
     process.exit(1);
   }
@@ -38,8 +38,7 @@ export const env = {
   nodeEnv: process.env.NODE_ENV || 'production',
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
 
-  // Anthropic and Domo configurations
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+  // Domo configurations
   domoClientDomain: process.env.DOMO_CLIENT_DOMAIN,
   domoClientToken: process.env.DOMO_CLIENT_TOKEN,
   domoAgentEmail: process.env.DOMO_AGENT_EMAIL || 'your_email@gwcdata.ai',

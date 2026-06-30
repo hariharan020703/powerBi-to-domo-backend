@@ -1,15 +1,16 @@
 import { Router } from 'express';
 import { EventEmitter } from 'events';
 import axios from 'axios';
-import { env } from '../config/env.js';
 import { executeQuery, getDashboardTiles, getDatasetTables, getTableData, getDatasetRelationships, getDatasetColumns, getDatasetTableMeta, getPowerQueryExpressions, getDatasetMeasures } from '../services/powerbiService.js';
 import { createDomoDataset, uploadDataToDomoDataset } from '../services/domoDatasetService.js';
 import { resolveRelationships, createDomoDataModel, fetchDomoDatasetSchema } from '../services/domoDataflowService.js';
 import { parsePowerQuerySteps, buildDataflowDefinition } from '../services/powerQueryParser.js';
 import { createMagicEtlDataflow, createModelViewMagicEtl, runMagicEtlDataflow, pollEtlExecution } from '../services/magicEtlService.js';
 import { classifyDaxMeasure, inferBeastModeDataType, detectAggregated, extractNonAggregatedColumns, buildMeasureDependencyGraph, detectCycles, topologicalSortMeasures, substituteDependencies, sanitizeBeastModeFormula } from '../services/beastModeCompat.js';
-import { convertWithValidation } from '../services/daxToBeastModeService.js';
+import { convertDaxToBeastModeGrok, resetDaxRateLimit } from '../services/groqDaxService.js';
+import { resetPqRateLimit } from '../services/groqPowerQueryService.js';
 import { createBeastModeFunctionsBulk, extractBulkCreatedIds, fetchCurrentUserId, createBeastModeFunction } from '../services/beastModeService.js';
+import { createDomoCard, createDomoPage, addCardsToPage } from '../services/domoCardService.js';
 
 const router = Router();
 const migrationEmitter = new EventEmitter();
@@ -116,6 +117,36 @@ function buildCsv(rawRows, rawColumnNames) {
   return { csvString, columns };
 }
 
+// REPLACE WITH:
+function getTrivialFormula(expression) {
+  const trimmed = expression.trim();
+
+  if (/^\d+(\.\d+)?$/.test(trimmed)) return trimmed;
+
+  const countMatch = trimmed.match(/^COUNT\s*\(\s*'[^']*'\s*\[([^\]]+)\]\s*\)\s*\+\s*0$/i);
+  if (countMatch) return `IFNULL(COUNT(\`${countMatch[1]}\`), 0)`;
+
+  const countNoPlus = trimmed.match(/^COUNT\s*\(\s*'[^']*'\s*\[([^\]]+)\]\s*\)$/i);
+  if (countNoPlus) return `IFNULL(COUNT(\`${countNoPlus[1]}\`), 0)`;
+
+  const sumMatch = trimmed.match(/^SUM\s*\(\s*'[^']*'\s*\[([^\]]+)\]\s*\)\s*\+\s*0$/i);
+  if (sumMatch) return `IFNULL(SUM(\`${sumMatch[1]}\`), 0)`;
+
+  const sumNoPlus = trimmed.match(/^SUM\s*\(\s*'[^']*'\s*\[([^\]]+)\]\s*\)$/i);
+  if (sumNoPlus) return `IFNULL(SUM(\`${sumNoPlus[1]}\`), 0)`;
+
+  const avgMatch = trimmed.match(/^AVERAGE\s*\(\s*'[^']*'\s*\[([^\]]+)\]\s*\)$/i);
+  if (avgMatch) return `AVG(\`${avgMatch[1]}\`)`;
+
+  const minMatch = trimmed.match(/^MIN\s*\(\s*'[^']*'\s*\[([^\]]+)\]\s*\)$/i);
+  if (minMatch) return `MIN(\`${minMatch[1]}\`)`;
+
+  const maxMatch = trimmed.match(/^MAX\s*\(\s*'[^']*'\s*\[([^\]]+)\]\s*\)$/i);
+  if (maxMatch) return `MAX(\`${maxMatch[1]}\`)`;
+
+  return null;
+}
+
 /**
  * Orchestrates Beast Mode migration for a single dataset's measures.
  *
@@ -132,11 +163,6 @@ function buildCsv(rawRows, rawColumnNames) {
 async function migrateMeasuresToBeastModes(measures, domoDatasetId, availableColumns, reportId, updateStatusFn, currentResults) {
   const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
   const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-
-  // Hardcoded formula overrides for measures that consistently fail LLM conversion
-  const FORMULA_OVERRIDES = {
-    'Avg Cost Per Req': "SUM(`PO_COST`) / NULLIF(SUM(CASE WHEN `PO_COST` > 0 THEN 1 ELSE 0 END), 0)",
-  };
 
   let ownerId = null;
   if (domain && token) {
@@ -269,33 +295,32 @@ async function migrateMeasuresToBeastModes(measures, domoDatasetId, availableCol
       continue;
     }
 
-    // Check for hardcoded formula override — bypass LLM conversion entirely
-    if (FORMULA_OVERRIDES[mName]) {
-      console.log(`[BEAST MODE] Using hardcoded formula override for '${mName}'`);
-      const overrideFormula = FORMULA_OVERRIDES[mName];
-      convertedFormulasMap.set(mName, overrideFormula);
+    // Inline substitute converted dependencies
+    const targetDax = substituteDependencies(measure.expression, convertedFormulasMap);
+
+    const trivialFormula = getTrivialFormula(targetDax);
+    if (trivialFormula) {
+      console.log(`[BEAST MODE] Skipping LLM for trivial measure '${mName}': ${trivialFormula}`);
+      convertedFormulasMap.set(mName, trivialFormula);
       enrichedMeasures.push({
         name: mName,
         daxExpression: measure.expression,
         classification: 'DIRECT_BEASTMODE',
-        beastModeFormula: overrideFormula,
+        beastModeFormula: trivialFormula,
         status: 'converted',
         domoFunctionId: null,
         error: null,
       });
       readyForDomoMeasures.push({
         name: mName,
-        expression: overrideFormula,
-        dataType: inferBeastModeDataType(overrideFormula),
-        aggregated: detectAggregated(overrideFormula),
-        nonAggregatedColumns: extractNonAggregatedColumns(overrideFormula),
+        expression: trivialFormula,
+        dataType: inferBeastModeDataType(trivialFormula),
+        aggregated: detectAggregated(trivialFormula),
+        nonAggregatedColumns: extractNonAggregatedColumns(trivialFormula),
         domoDatasetId,
       });
       continue;
     }
-
-    // Inline substitute converted dependencies
-    const targetDax = substituteDependencies(measure.expression, convertedFormulasMap);
 
     // Classify the substituted expression to keep track of its logic type
     const { classification, reason } = classifyDaxMeasure(mName, targetDax, false);
@@ -303,11 +328,7 @@ async function migrateMeasuresToBeastModes(measures, domoDatasetId, availableCol
 
     // Call LLM conversion for all measures
     try {
-      const result = await convertWithValidation({
-        measureName: mName,
-        daxExpression: targetDax,
-        availableColumns,
-      });
+      const result = await convertDaxToBeastModeGrok(mName, targetDax, availableColumns);
 
       if (result.status === 'converted') {
         convertedFormulasMap.set(mName, result.formula);
@@ -371,29 +392,29 @@ async function migrateMeasuresToBeastModes(measures, domoDatasetId, availableCol
     m.expression = sanitizeBeastModeFormula(m.expression);
   }
 
-  // 8. Bulk-create successful measures in Domo
+  // 8. Bulk-create successful measures in Domo (Commented out bulk upload per user request; using single upload API instead)
   if (readyForDomoMeasures.length > 0 && ownerId && domain && token) {
-    try {
-      updateStatusFn(reportId, {
-        ...migrations.get(reportId),
-        status: `Creating ${readyForDomoMeasures.length} Beast Mode(s) in Domo...`,
-      });
-
-      const bulkResponse = await createBeastModeFunctionsBulk(domain, token, ownerId, readyForDomoMeasures);
-      const idMap = extractBulkCreatedIds(bulkResponse, readyForDomoMeasures.map(m => m.name));
-
-      for (const cm of readyForDomoMeasures) {
-        const enriched = enrichedMeasures.find(m => m.name === cm.name);
-        if (enriched) {
-          enriched.domoFunctionId = idMap.get(cm.name) || null;
-          enriched.status = 'created';
-          summary.created++;
-        }
-      }
-
-      console.log(`[BEAST MODE] Bulk creation succeeded: ${readyForDomoMeasures.length} Beast Mode(s) created.`);
-    } catch (bulkErr) {
-      console.warn(`[BEAST MODE] Bulk creation failed (${bulkErr.message}). Falling back to individual creation...`);
+    // try {
+    //   updateStatusFn(reportId, {
+    //     ...migrations.get(reportId),
+    //     status: `Creating ${readyForDomoMeasures.length} Beast Mode(s) in Domo...`,
+    //   });
+    // 
+    //   const bulkResponse = await createBeastModeFunctionsBulk(domain, token, ownerId, readyForDomoMeasures);
+    //   const idMap = extractBulkCreatedIds(bulkResponse, readyForDomoMeasures.map(m => m.name));
+    // 
+    //   for (const cm of readyForDomoMeasures) {
+    //     const enriched = enrichedMeasures.find(m => m.name === cm.name);
+    //     if (enriched) {
+    //       enriched.domoFunctionId = idMap.get(cm.name) || null;
+    //       enriched.status = 'created';
+    //       summary.created++;
+    //     }
+    //   }
+    // 
+    //   console.log(`[BEAST MODE] Bulk creation succeeded: ${readyForDomoMeasures.length} Beast Mode(s) created.`);
+    // } catch (bulkErr) {
+    //   console.warn(`[BEAST MODE] Bulk creation failed (${bulkErr.message}). Falling back to individual creation...`);
       for (const cm of readyForDomoMeasures) {
         const enriched = enrichedMeasures.find(m => m.name === cm.name);
         try {
@@ -414,7 +435,7 @@ async function migrateMeasuresToBeastModes(measures, domoDatasetId, availableCol
           }
         }
       }
-    }
+    // }
   } else if (readyForDomoMeasures.length > 0 && !ownerId) {
     for (const cm of readyForDomoMeasures) {
       const enriched = enrichedMeasures.find(m => m.name === cm.name);
@@ -435,6 +456,9 @@ async function migrateMeasuresToBeastModes(measures, domoDatasetId, availableCol
  */
 router.post('/start', async (req, res, next) => {
   const { reportId, reportName, datasetId, workspaceId, isDashboard } = req.body;
+
+  resetDaxRateLimit();
+  resetPqRateLimit();
 
   if (!reportId) {
     return res.status(400).json({
@@ -697,14 +721,15 @@ router.post('/start', async (req, res, next) => {
                       if (magicEtlResult && magicEtlResult.dataflowId) {
                         setTableState(tableName, { status: 'etl_created', magicEtl: magicEtlResult });
                         try {
-                          const { executionId } = await runMagicEtlDataflow(magicEtlResult.dataflowId);
-                          const execResult = await pollEtlExecution(magicEtlResult.dataflowId, executionId);
-                          if (!execResult.succeeded) {
-                            console.warn(`[MAGIC ETL] Report ETL execution failed for '${tableName}': ${execResult.error}`);
-                            magicEtlResult.executionStatus = execResult.status;
-                            magicEtlResult.outputDatasetId = null;
-                          } else {
-                            magicEtlResult.executionStatus = 'SUCCESS';
+                          // Trigger execution disabled per request
+                          // const { executionId } = await runMagicEtlDataflow(magicEtlResult.dataflowId);
+                          // const execResult = await pollEtlExecution(magicEtlResult.dataflowId, executionId);
+                          // if (!execResult.succeeded) {
+                          //   console.warn(`[MAGIC ETL] Report ETL execution failed for '${tableName}': ${execResult.error}`);
+                          //   magicEtlResult.executionStatus = execResult.status;
+                          //   magicEtlResult.outputDatasetId = null;
+                          // } else {
+                            magicEtlResult.executionStatus = 'SKIPPED';
                             const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
                             const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
                             const headers = {
@@ -721,7 +746,7 @@ router.post('/start', async (req, res, next) => {
                               null;
                             magicEtlResult.outputDatasetId = outputDatasetId;
                             console.log(`[MAGIC ETL] Fetched dataflow details. Output Dataset ID: ${outputDatasetId}`);
-                          }
+                          // }
                         } catch (runErr) {
                           console.error(`[MAGIC ETL RUN ERROR] Non-fatal (report) for '${tableName}': ${runErr.message}`);
                           magicEtlResult.executionStatus = 'RUN_ERROR';
@@ -731,6 +756,8 @@ router.post('/start', async (req, res, next) => {
                           setTableState(tableName, { status: 'etl_created', magicEtl: magicEtlResult });
                         }
                       }
+                    } else {
+                      magicEtlResult = { skipped: true };
                     }
                   } catch (etlErr) {
                     console.error(`[MAGIC ETL ERROR] Magic ETL creation failed: ${etlErr.message}`);
@@ -751,6 +778,8 @@ router.post('/start', async (req, res, next) => {
                   } catch (cardSchemaErr) {
                     console.warn(`[MIGRATION WARNING] Failed to fetch transformed schema columns:`, cardSchemaErr.message);
                   }
+                } else {
+                  finalDomoDatasetId = targetDomoDatasetId;
                 }
 
                 // Update status to success
@@ -810,19 +839,45 @@ router.post('/start', async (req, res, next) => {
             }
           }
 
-          // 5. Create KPI card in Domo
-          updateStatus(reportId, {
-            status: `Creating card ${i + 1}/${datasetIds.length} in Domo`,
-            progress: baseProgress + 20,
-            migratedTables: results
-          });
+          try {
+            const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+            const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+            updateStatus(reportId, {
+              ...migrations.get(reportId),
+              status: `Creating Domo card ${i + 1}/${datasetIds.length}`,
+              progress: baseProgress + 20,
+              migratedTables: results
+            });
 
-          const xColumn = cardColumns[0]?.name || '';
-          const yColumn = cardColumns.length > 1 ? cardColumns[1]?.name : cardColumns[0]?.name || '';
+            let dashCardOwnerId = null;
+            try {
+              dashCardOwnerId = await fetchCurrentUserId(domain, token);
+            } catch (e) { console.warn('[CARD] Owner resolve failed:', e.message); }
 
-          console.log(`[MIGRATION] Skipping card creation for table '${tableName}' (MCP is not used).`);
-          const numericCardId = 123456 + i;
-          createdCardIds.push(numericCardId);
+            const dashMigratedMeasures = migrations.get(reportId)?.migratedMeasures || [];
+            const dashBeastModeIds = dashMigratedMeasures
+              .filter(m => m.domoFunctionId && m.status === 'created')
+              .map(m => m.domoFunctionId);
+
+            const dashCardResult = await createDomoCard(domain, token, {
+              cardName: `${reportName} - ${ctx.title}`,
+              domoDatasetId: finalDomoDatasetId,
+              columns: cardColumns || [],
+              beastModeIds: dashBeastModeIds,
+              ownerId: dashCardOwnerId
+            });
+
+            createdCardIds.push(dashCardResult.cardId);
+            setTableState(tableName, {
+              domoCardId: dashCardResult.cardId,
+              domoCardUrl: dashCardResult.cardUrl
+            });
+            console.log(`[CARD] Dashboard card created: ${dashCardResult.cardUrl}`);
+
+          } catch (dashCardErr) {
+            console.error(`[CARD ERROR] Dashboard card creation failed for '${tableName}':`, dashCardErr.message);
+            createdCardIds.push(`failed-${i}`);
+          }
         }
 
         if (createdCardIds.length === 0) {
@@ -833,17 +888,37 @@ router.post('/start', async (req, res, next) => {
           throw err;
         }
 
-        // 6. Create Domo Dashboard (Page)
-        updateStatus(reportId, { status: 'Assembling Domo Dashboard page', progress: 90, migratedTables: results });
-        console.log(`[MIGRATION] Skipping dashboard creation for "${reportName}" (MCP is not used).`);
+        // After the dataset loop, create a real dashboard page for the dashboard flow too
+        let dashPageId = null;
+        let dashPageUrl = null;
+        const realCardIds = createdCardIds.filter(id => !String(id).startsWith('failed-'));
+
+        if (realCardIds.length > 0) {
+          try {
+            const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+            const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+            let dashPageOwnerId = null;
+            try { dashPageOwnerId = await fetchCurrentUserId(domain, token); } catch(e) {}
+
+            const dashPage = await createDomoPage(domain, token, {
+              pageName: `${reportName} Dashboard`,
+              ownerId: dashPageOwnerId
+            });
+            dashPageId = dashPage.pageId;
+            dashPageUrl = dashPage.pageUrl;
+            await addCardsToPage(domain, token, dashPageId, realCardIds);
+          } catch (dashPageErr) {
+            console.error('[CARD ERROR] Dashboard page creation failed:', dashPageErr.message);
+          }
+        }
 
         const finalState = {
           status: 'complete',
           success: true,
           progress: 100,
           reportName,
-          domoDashboardId: 'mock-dashboard-id',
-          domoCardUrl: 'https://mock-domo-url/page/mock-dashboard-id', // UI opens cardUrl when clicking View in Domo
+          domoDashboardId: dashPageId,                         // real page ID
+          domoCardUrl: dashPageUrl || results[0]?.domoCardUrl, // real page URL
           migratedTables: results,
           mExpressionFetchFailed: migrations.get(reportId)?.mExpressionFetchFailed || false,
           mExpressionFetchError: migrations.get(reportId)?.mExpressionFetchError || null,
@@ -1089,14 +1164,15 @@ router.post('/start', async (req, res, next) => {
                     if (magicEtlResult && magicEtlResult.dataflowId) {
                       setTableState(tableName, { status: 'etl_created', magicEtl: magicEtlResult });
                       try {
-                        const { executionId } = await runMagicEtlDataflow(magicEtlResult.dataflowId);
-                        const execResult = await pollEtlExecution(magicEtlResult.dataflowId, executionId);
-                        if (!execResult.succeeded) {
-                          console.warn(`[MAGIC ETL] Report ETL execution failed for '${tableName}': ${execResult.error}`);
-                          magicEtlResult.executionStatus = execResult.status;
-                          magicEtlResult.outputDatasetId = null;
-                        } else {
-                          magicEtlResult.executionStatus = 'SUCCESS';
+                        // Trigger execution disabled per request
+                        // const { executionId } = await runMagicEtlDataflow(magicEtlResult.dataflowId);
+                        // const execResult = await pollEtlExecution(magicEtlResult.dataflowId, executionId);
+                        // if (!execResult.succeeded) {
+                        //   console.warn(`[MAGIC ETL] Report ETL execution failed for '${tableName}': ${execResult.error}`);
+                        //   magicEtlResult.executionStatus = execResult.status;
+                        //   magicEtlResult.outputDatasetId = null;
+                        // } else {
+                          magicEtlResult.executionStatus = 'SKIPPED';
                           const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
                           const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
                           const headers = {
@@ -1113,7 +1189,7 @@ router.post('/start', async (req, res, next) => {
                             null;
                           magicEtlResult.outputDatasetId = outputDatasetId;
                           console.log(`[MAGIC ETL] Fetched dataflow details. Output Dataset ID: ${outputDatasetId}`);
-                        }
+                        // }
                       } catch (runErr) {
                         console.error(`[MAGIC ETL RUN ERROR] Non-fatal (report) for '${tableName}': ${runErr.message}`);
                         magicEtlResult.executionStatus = 'RUN_ERROR';
@@ -1297,8 +1373,14 @@ router.post('/start', async (req, res, next) => {
 
           if (canonicalTable) {
             targetDomoDatasetId = canonicalTable.magicEtl?.outputDatasetId || canonicalTable.domoDatasetId;
-            targetColumns = canonicalTable.columns?.map(c => c.name) || [];
             console.log(`[MIGRATION] Using table '${canonicalTable.tableName}' as canonical target: ${targetDomoDatasetId}`);
+
+            const allColumnsSet = new Set();
+            for (const t of results.filter(r => r.status === 'success')) {
+              (t.columns || []).forEach(c => allColumnsSet.add(c.name));
+            }
+            targetColumns = Array.from(allColumnsSet);
+            console.log(`[MIGRATION] Total columns across all tables for Beast Mode: ${targetColumns.length}`);
           }
         }
 
@@ -1352,21 +1434,124 @@ router.post('/start', async (req, res, next) => {
           });
         }
 
-        // Step 5: Create Domo card
-        updateStatus(reportId, { status: 'Creating Domo card', progress: 85, migratedTables: results });
+        // Step 5: Create real Domo cards and dashboard page
+        updateStatus(reportId, { status: 'Creating Domo cards and dashboard', progress: 85, migratedTables: results });
+
         const successfulTables = results.filter(t => t.status === 'success');
         if (successfulTables.length === 0) {
           throw new Error("No tables migrated successfully.");
         }
 
         const firstSuccessTable = successfulTables[0];
-        const finalTargetDomoDatasetId = targetDomoDatasetId || ((firstSuccessTable.magicEtl && firstSuccessTable.magicEtl.outputDatasetId)
-          ? firstSuccessTable.magicEtl.outputDatasetId
-          : firstSuccessTable.domoDatasetId);
+        const finalTargetDomoDatasetId = targetDomoDatasetId || (
+          (firstSuccessTable.magicEtl && firstSuccessTable.magicEtl.outputDatasetId)
+            ? firstSuccessTable.magicEtl.outputDatasetId
+            : firstSuccessTable.domoDatasetId
+        );
 
-        let domoCardId = 'mock-card-id';
-        let domoCardUrl = 'https://mock-domo-url/card/mock-card-id';
-        let cardCreationWarning = 'MCP is removed. Card creation skipped/mocked.';
+        const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+        const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+
+        let domoCardId = null;
+        let domoCardUrl = null;
+        let domoDashboardPageId = null;
+        let domoDashboardPageUrl = null;
+        let cardCreationWarning = null;
+
+        try {
+          // Resolve owner ID for card/page creation
+          let cardOwnerId = null;
+          try {
+            cardOwnerId = await fetchCurrentUserId(domain, token);
+          } catch (ownerErr) {
+            console.warn('[CARD] Could not resolve owner ID:', ownerErr.message);
+          }
+
+          // Get the Beast Mode IDs from migrated measures for this dataset
+          const migratedMeasures = migrations.get(reportId)?.migratedMeasures || [];
+          const beastModeIds = migratedMeasures
+            .filter(m => m.domoFunctionId && m.status === 'created')
+            .map(m => m.domoFunctionId);
+
+          // Create one card per successful table
+          const createdCards = [];
+          for (const table of successfulTables) {
+            const tableDatasetId = (table.magicEtl?.outputDatasetId) || table.domoDatasetId;
+            if (!tableDatasetId) continue;
+
+            try {
+              updateStatus(reportId, {
+                ...migrations.get(reportId),
+                status: `Creating card for table: ${table.tableName}`,
+                progress: 86,
+                migratedTables: results
+              });
+
+              const cardResult = await createDomoCard(domain, token, {
+                cardName: `${reportName} - ${table.tableName}`,
+                domoDatasetId: tableDatasetId,
+                columns: table.columns || [],
+                beastModeIds,
+                ownerId: cardOwnerId
+              });
+
+              createdCards.push({
+                tableName: table.tableName,
+                cardId: cardResult.cardId,
+                cardUrl: cardResult.cardUrl
+              });
+
+              console.log(`[CARD] Created card for '${table.tableName}': ${cardResult.cardUrl}`);
+            } catch (cardErr) {
+              console.error(`[CARD ERROR] Failed to create card for '${table.tableName}':`, cardErr.message);
+              cardCreationWarning = `Some cards failed to create: ${cardErr.message}`;
+            }
+          }
+
+          // Set primary card reference from first successful card
+          if (createdCards.length > 0) {
+            domoCardId = createdCards[0].cardId;
+            domoCardUrl = createdCards[0].cardUrl;
+          }
+
+          // Create dashboard page and add all cards to it
+          if (createdCards.length > 0) {
+            try {
+              updateStatus(reportId, {
+                ...migrations.get(reportId),
+                status: 'Creating Domo dashboard page',
+                progress: 90,
+                migratedTables: results
+              });
+
+              const pageResult = await createDomoPage(domain, token, {
+                pageName: `${reportName} Dashboard`,
+                ownerId: cardOwnerId
+              });
+
+              domoDashboardPageId = pageResult.pageId;
+              domoDashboardPageUrl = pageResult.pageUrl;
+
+              await addCardsToPage(domain, token, domoDashboardPageId, createdCards.map(c => c.cardId));
+              console.log(`[CARD] Dashboard page created: ${domoDashboardPageUrl}`);
+
+            } catch (pageErr) {
+              console.error('[CARD ERROR] Failed to create dashboard page:', pageErr.message);
+              cardCreationWarning = cardCreationWarning
+                ? cardCreationWarning + '; Dashboard page creation failed'
+                : 'Dashboard page creation failed: ' + pageErr.message;
+            }
+          }
+
+          // Store card results in table state
+          for (const card of createdCards) {
+            setTableState(card.tableName, { domoCardId: card.cardId, domoCardUrl: card.cardUrl });
+          }
+
+        } catch (allCardErr) {
+          console.error('[CARD ERROR] Card creation process failed (non-fatal):', allCardErr.message);
+          cardCreationWarning = 'Card creation failed: ' + allCardErr.message;
+        }
 
         const finalState = {
           status: 'complete',
@@ -1374,8 +1559,10 @@ router.post('/start', async (req, res, next) => {
           progress: 100,
           reportName,
           domoDatasetId: finalTargetDomoDatasetId,
-          domoCardId,
-          domoCardUrl,
+          domoCardId,          // now real card ID
+          domoCardUrl,         // now real card URL
+          domoDashboardId: domoDashboardPageId,
+          domoDashboardUrl: domoDashboardPageUrl,
           migratedTables: results,
           domoDataModelId: domoDataflowResult?.modelId || null,
           domoDataModelUrl: domoDataflowResult?.modelUrl || null,
@@ -1395,10 +1582,10 @@ router.post('/start', async (req, res, next) => {
             status: m.status,
             reason: m.error || null,
           })),
-          cardCreationWarning,
+          cardCreationWarning: cardCreationWarning || null,
           message: cardCreationWarning
-            ? `Migration completed with card creation warning: ${cardCreationWarning}`
-            : 'Migration completed successfully.'
+            ? `Migration completed with warning: ${cardCreationWarning}`
+            : 'Migration completed successfully. Cards and dashboard created in Domo.'
         };
 
         updateStatus(reportId, finalState);
@@ -1440,7 +1627,7 @@ router.get('/status/:reportId', (req, res) => {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no' // Prevent proxy buffering
+    'X-Accel-Buffering': 'no'
   });
 
   // Push immediate current state if exists
@@ -1461,6 +1648,152 @@ router.get('/status/:reportId', (req, res) => {
   req.on('close', () => {
     migrationEmitter.off(reportId, statusListener);
   });
+});
+
+/**
+ * GET /api/migration/test-card-creation
+ * Tests the full card creation flow: cookie login → card creation → result
+ */
+router.get('/test-card-creation', async (req, res) => {
+  const results = {
+    step1_cookieLogin: { status: 'pending', detail: null },
+    step2_cardCreation: { status: 'pending', detail: null },
+    step3_pageCreation: { status: 'pending', detail: null },
+  };
+
+  const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+  const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+
+  // ── Step 1: Test cookie login ──────────────────────────────────────────────
+  try {
+    const { getAutomatedDomoCookie } = await import('../services/domoCookieService.js');
+    const cookie = await getAutomatedDomoCookie();
+
+    if (cookie) {
+      results.step1_cookieLogin = {
+        status: 'success',
+        detail: `Cookie obtained. Length: ${cookie.length}. Starts with: ${cookie.slice(0, 40)}...`,
+      };
+    } else {
+      results.step1_cookieLogin = {
+        status: 'failed',
+        detail: 'getAutomatedDomoCookie() returned null. Check DOMO_LOGIN_EMAIL, DOMO_LOGIN_PASSWORD, DOMO_CLIENT_DOMAIN in .env',
+      };
+      return res.status(500).json(results);
+    }
+  } catch (err) {
+    results.step1_cookieLogin = { status: 'error', detail: err.message };
+    return res.status(500).json(results);
+  }
+
+  // ── Step 2: Test card creation using first available dataset ───────────────
+  try {
+    const { createDomoCard } = await import('../services/domoCardService.js');
+
+    // Use the known dataset ID from your migration logs
+    const testDatasetId = '1fa07c90-0cfe-4707-9964-6756799aef84';
+    const testColumns = [
+      { name: 'Unique_Key', type: 'STRING' },
+      { name: 'Order_DateTime', type: 'DATETIME' },
+      { name: 'Ordered_By', type: 'STRING' },
+    ];
+
+    const cardResult = await createDomoCard(domain, token, {
+      cardName: `Test Card - ${new Date().toISOString()}`,
+      domoDatasetId: testDatasetId,
+      columns: testColumns,
+      beastModeIds: [],
+      ownerId: null,
+    });
+
+    if (cardResult.cardId) {
+      results.step2_cardCreation = {
+        status: 'success',
+        detail: `Card created! ID: ${cardResult.cardId} | URL: ${cardResult.cardUrl}`,
+        cardId: cardResult.cardId,
+        cardUrl: cardResult.cardUrl,
+      };
+    } else {
+      results.step2_cardCreation = {
+        status: 'failed',
+        detail: cardResult.error || 'Card creation returned null ID',
+      };
+      return res.status(500).json(results);
+    }
+  } catch (err) {
+    results.step2_cardCreation = { status: 'error', detail: err.message };
+    return res.status(500).json(results);
+  }
+
+  // ── Step 3: Test page creation ─────────────────────────────────────────────
+  try {
+    const { createDomoPage, addCardsToPage } = await import('../services/domoCardService.js');
+
+    const pageResult = await createDomoPage(domain, token, {
+      pageName: `Test Page - ${new Date().toISOString()}`,
+      ownerId: null,
+    });
+
+    if (pageResult.pageId) {
+      results.step3_pageCreation = {
+        status: 'success',
+        detail: `Page created! ID: ${pageResult.pageId} | URL: ${pageResult.pageUrl}`,
+        pageId: pageResult.pageId,
+        pageUrl: pageResult.pageUrl,
+      };
+
+      // Also try adding the card to the page
+      const cardId = results.step2_cardCreation.cardId;
+      if (cardId) {
+        try {
+          await addCardsToPage(domain, token, pageResult.pageId, [cardId]);
+          results.step3_pageCreation.detail += ' | Card added to page successfully';
+        } catch (addErr) {
+          results.step3_pageCreation.detail += ` | Warning: Could not add card to page: ${addErr.message}`;
+        }
+      }
+    } else {
+      results.step3_pageCreation = {
+        status: 'failed',
+        detail: pageResult.error || 'Page creation returned null ID',
+      };
+    }
+  } catch (err) {
+    results.step3_pageCreation = { status: 'error', detail: err.message };
+  }
+
+  // ── Final response ─────────────────────────────────────────────────────────
+  const allPassed = Object.values(results).every(r => r.status === 'success');
+  return res.status(allPassed ? 200 : 500).json({
+    overall: allPassed ? '✅ All steps passed' : '❌ Some steps failed',
+    results,
+  });
+});
+
+
+// TEMPORARY TEST — add this route to migrationRouter.js
+router.get('/test-card-creation', async (req, res) => {
+  try {
+    const { createDomoCard } = await import('../services/domoCardService.js');
+    const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
+    const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
+
+    const cardResult = await createDomoCard(domain, token, {
+      cardName: `Automated Test Card - ${new Date().toISOString()}`,
+      domoDatasetId: '1fa07c90-0cfe-4707-9964-6756799aef84',
+      columns: [
+        { name: 'Unique_Key', type: 'STRING' },
+        { name: 'Order_DateTime', type: 'DATETIME' },
+        { name: 'Ordered_By', type: 'STRING' },
+      ],
+      beastModeIds: [],
+      ownerId: null,
+    });
+
+    res.json(cardResult);
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
 });
 
 export default router;

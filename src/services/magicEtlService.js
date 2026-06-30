@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-function getAuthHeaders(token) {
+export function getAuthHeaders(token) {
   return {
     'Content-Type': 'application/json',
     'X-DOMO-DEVELOPER-TOKEN': token,
@@ -9,21 +9,11 @@ function getAuthHeaders(token) {
 
 // ─── Unique ID Generator ──────────────────────────────────────────────────────
 
-/**
- * Creates a tile ID generator scoped to a single dataflow creation call.
- * Prevents ID collisions when multiple migrations run concurrently.
- *
- * @returns {function(string): string} A function that takes a prefix and returns a unique tile ID
- */
 function createTileIdGenerator() {
   let count = 0;
   return (prefix) => `${prefix}-${++count}`;
 }
 
-/**
- * Validates that required Domo environment variables are set.
- * Throws if any are missing.
- */
 function validateDomoEnv() {
   const missing = ['DOMO_CLIENT_DOMAIN', 'DOMO_CLIENT_TOKEN'].filter(
     k => !process.env[k]?.trim()
@@ -33,7 +23,7 @@ function validateDomoEnv() {
   }
 }
 
-async function requestWithRetry(requestFn, maxRetries = 5) {
+async function requestWithRetry(requestFn, maxRetries = 3) {
   let attempt = 0;
   while (true) {
     try {
@@ -47,7 +37,6 @@ async function requestWithRetry(requestFn, maxRetries = 5) {
         throw error;
       }
 
-      // Exponential backoff: 2s, 4s, 8s...
       const backoffDelay = 2000 * Math.pow(2, attempt);
       console.warn(`[MAGIC ETL SERVICE] Request failed (${error.message}). Retrying in ${backoffDelay}ms (Attempt ${attempt}/${maxRetries})...`);
       await new Promise(resolve => setTimeout(resolve, backoffDelay));
@@ -55,7 +44,7 @@ async function requestWithRetry(requestFn, maxRetries = 5) {
   }
 }
 
-async function fetchDatasetColumns(domain, token, datasetId) {
+export async function fetchDatasetColumns(domain, token, datasetId) {
   const headers = {
     'X-DOMO-DEVELOPER-TOKEN': token,
     'Content-Type': 'application/json'
@@ -91,10 +80,6 @@ async function fetchDatasetColumns(domain, token, datasetId) {
   });
 }
 
-/**
- * Creates the gui object for an individual action tile.
- * Every action must have: x, y, color, colorSource, sampleJson.
- */
 function makeActionGui(x, y) {
   return {
     x,
@@ -105,9 +90,6 @@ function makeActionGui(x, y) {
   };
 }
 
-/**
- * Build a LoadFromVault action (input tile).
- */
 function buildLoadAction(id, name, dataSourceId, x, y) {
   return {
     type: 'LoadFromVault',
@@ -118,17 +100,16 @@ function buildLoadAction(id, name, dataSourceId, x, y) {
   };
 }
 
-/**
- * Build a PublishToVault action (output tile).
- */
 function buildOutputAction(id, name, x, y, dependsOnId) {
   return {
     type: 'PublishToVault',
     id,
     name,
-    dataSourceName: name,  // ADD THIS — must match outputs array entry
+    dataSourceName: name,
     dependsOn: [dependsOnId],
-    settings: {},
+    settings: {
+      "selectAction": name
+    },
     gui: { x, y },
     versionChainType: 'REPLACE',
     schemaSource: 'DATAFLOW',
@@ -136,55 +117,10 @@ function buildOutputAction(id, name, x, y, dependsOnId) {
   };
 }
 
-/**
- * Helper to compute excludeColumns2 case-insensitively.
- * Excludes any column in rightCols if it exists in leftCols (duplicate check) or is one of the rightKeys.
- */
-function getExcludeColumns(leftCols, rightCols, rightKeys) {
-  const leftColSet = new Set(
-    (leftCols || [])
-      .filter(Boolean)
-      .map(c => String(c).trim().toLowerCase())
-  );
-
-  const rKeys = (Array.isArray(rightKeys) ? rightKeys : [rightKeys])
-    .filter(Boolean)
-    .map(k => String(k).trim().toLowerCase());
-
-  const toExclude = [];
-
-  for (const col of (rightCols || [])) {
-    if (!col) continue;
-
-    const colLower = String(col).trim().toLowerCase();
-
-    if (leftColSet.has(colLower) || rKeys.includes(colLower)) {
-      toExclude.push(col);
-    }
-  }
-
-  return toExclude;
-}
-
-/**
- * Build a JoinAction tile.
- *
- * @param {string} id - Tile ID
- * @param {string} name - Human-readable join name
- * @param {string} joinType - JOIN type: LEFT, INNER, FULL
- * @param {string|string[]} leftKey - Left join key column(s)
- * @param {string|string[]} rightKey - Right join key column(s)
- * @param {number} x - GUI x position
- * @param {number} y - GUI y position
- * @param {string} step1Id - Left input tile ID
- * @param {string} step2Id - Right input tile ID
- * @returns {object} MergeJoin action object
- */
 function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, step2Id) {
-  // Map joinType to Domo format
-  const domoJoinType = joinType === 'LEFT' ? 'LEFT OUTER'
+  const domoJoinType = joinType === 'LEFT' || joinType === 'LEFT OUTER' ? 'LEFT OUTER'
     : joinType === 'INNER' ? 'INNER'
-      : joinType === 'FULL' ? 'FULL OUTER'
+      : joinType === 'FULL' || joinType === 'FULL OUTER' ? 'FULL OUTER'
         : 'LEFT OUTER';
 
   return {
@@ -203,14 +139,6 @@ function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, s
   };
 }
 
-
-
-/**
- * Maps Power Query M type names to Domo ETL type names.
- *
- * @param {string} mType - M type string (e.g. 'type number', 'Int64.Type')
- * @returns {string} Domo ETL type: LONG, DOUBLE, DATE, DATETIME, or STRING
- */
 function mapMTypeToEtlType(mType) {
   const t = String(mType || '').toLowerCase().replace(/\s+/g, '');
   if (t === 'int64.type' || t === 'integer' || t === 'long') return 'LONG';
@@ -220,20 +148,12 @@ function mapMTypeToEtlType(mType) {
   return 'STRING';
 }
 
-// ─── Step Mapper ──────────────────────────────────────────────────────────────
+function mapStepToDomoAction(step, tileId, x, y, previousTileId, stepNameToTileId = {}) {
+  if (step.actionType === 'MANUAL_BUILD' || step.actionType === 'MANUAL_ACTION') {
+    console.warn(`[MAGIC ETL] Skipping MANUAL_BUILD step: ${step.stepName || step.description}`);
+    return null;
+  }
 
-/**
- * Maps a parsed ETL step (actionType + properties) into a valid Domo action object.
- * Every action includes: type, id, name, dependsOn, settings, gui
- *
- * @param {object} step - Parsed step with actionType and properties
- * @param {string} tileId - Unique tile ID
- * @param {number} x - GUI x position
- * @param {number} y - GUI y position
- * @param {string|null} previousTileId - ID of the previous tile in the chain (for dependsOn)
- * @returns {object} Domo action object
- */
-function mapStepToDomoAction(step, tileId, x, y, previousTileId) {
   const base = {
     id: tileId,
     name: step.stepName || step.description || `Step ${tileId}`,
@@ -308,16 +228,29 @@ function mapStepToDomoAction(step, tileId, x, y, previousTileId) {
         ]
       };
 
-    case 'ADD_CONSTANT':
+    case 'ADD_CONSTANT': {
+      const val = step.properties.value;
+      const dType = step.properties.dataType || 'STRING';
+      let exprStr = '';
+      if (dType === 'STRING') {
+        const strVal = String(val ?? '');
+        exprStr = strVal.startsWith("'") && strVal.endsWith("'") ? strVal : `'${strVal.replace(/'/g, "''")}'`;
+      } else if (dType === 'DATE' || dType === 'DATETIME') {
+        exprStr = String(val ?? 'NOW()');
+      } else {
+        exprStr = String(val ?? '0');
+      }
       return {
         ...base,
-        type: 'AddConstantAction',
-        settings: {
-          columnName: step.properties.columnName || '',
-          value: step.properties.value ?? '',
-          dataType: step.properties.dataType || 'STRING',
-        },
+        type: 'ExpressionEvaluator',
+        expressions: [
+          {
+            fieldName: step.properties.columnName || '',
+            expression: exprStr,
+          }
+        ]
       };
+    }
 
     case 'GROUP_BY':
       return {
@@ -374,14 +307,16 @@ function mapStepToDomoAction(step, tileId, x, y, previousTileId) {
         keys2: Array.isArray(step.properties.rightKey) ? step.properties.rightKey : [step.properties.rightKey || ''],
       };
 
-    case 'APPEND_ROWS':
+    case 'APPEND_ROWS': {
+      const rightStepName = step.properties.rightInputStepName;
+      const rightTileId = rightStepName && stepNameToTileId[rightStepName] ? stepNameToTileId[rightStepName] : previousTileId;
       return {
         ...base,
-        type: 'UnionAll',
-        settings: {
-          datasetsToAppend: step.properties.datasetsToAppend || [],
-        },
+        type: 'AppendRows',
+        settings: {},
+        dependsOn: [previousTileId, rightTileId],
       };
+    }
 
     case 'PIVOT':
       return {
@@ -448,17 +383,35 @@ function mapStepToDomoAction(step, tileId, x, y, previousTileId) {
         },
       };
 
-    case 'FIND_REPLACE':
+    case 'FIND_REPLACE': {
+      let fieldsList = [];
+      if (Array.isArray(step.properties.replacements)) {
+        fieldsList = step.properties.replacements.map(rep => ({
+          inStreamName: rep.column || '',
+          useRegex: false,
+          replaceString: rep.findValue || '',
+          replaceByString: rep.replaceValue || '',
+          wholeWord: false,
+          caseSensitive: rep.matchCase ?? false,
+        }));
+      } else if (step.properties.column) {
+        fieldsList = [
+          {
+            inStreamName: step.properties.column || '',
+            useRegex: false,
+            replaceString: step.properties.findValue || '',
+            replaceByString: step.properties.replaceValue || '',
+            wholeWord: false,
+            caseSensitive: step.properties.matchCase ?? false,
+          }
+        ];
+      }
       return {
         ...base,
-        type: 'FindReplaceAction',
-        settings: {
-          column: step.properties.column || '',
-          findValue: step.properties.findValue || '',
-          replaceValue: step.properties.replaceValue || '',
-          matchCase: step.properties.matchCase ?? false,
-        },
+        type: 'ReplaceString',
+        fields: fieldsList,
       };
+    }
 
     case 'DATE_OPERATIONS':
       return {
@@ -495,25 +448,11 @@ function mapStepToDomoAction(step, tileId, x, y, previousTileId) {
         },
       };
 
-    case 'MANUAL_BUILD':
     default:
-      return {
-        ...base,
-        type: 'ManualAction',
-        settings: {
-          manualDescription: step.properties?.description || step.description || 'Manual step - requires manual configuration in Domo.',
-        },
-      };
+      return null;
   }
 }
 
-// ─── Payload Wrapper ──────────────────────────────────────────────────────────
-
-/**
- * Wraps the actions array into a complete, valid Domo Magic ETL dataflow payload.
- * Includes ALL mandatory root-level fields and gui.canvases.default.elements
- * entries for every tile.
- */
 function buildMagicEtlPayload(name, actions, inputs, outputs) {
   return {
     name,
@@ -526,12 +465,6 @@ function buildMagicEtlPayload(name, actions, inputs, outputs) {
   };
 }
 
-/**
- * Validates the payload before submission. Throws if invalid.
- *
- * @param {object} payload - The Magic ETL dataflow payload to validate
- * @throws {Error} If validation fails
- */
 function validatePayload(payload) {
   const errors = [];
 
@@ -549,7 +482,6 @@ function validatePayload(payload) {
     }
   }
 
-  // Validate dependsOn references
   const actionIdSet = new Set(payload.actions.map(a => a.id));
   for (const action of payload.actions) {
     for (const dep of (action.dependsOn || [])) {
@@ -564,14 +496,6 @@ function validatePayload(payload) {
   }
 }
 
-// ─── createMagicEtlDataflow ───────────────────────────────────────────────────
-
-/**
- * Creates a Magic ETL dataflow in Domo for a single table's Power Query transforms.
- *
- * @param {object} dataflowDefinition - Output from buildDataflowDefinition()
- * @returns {{ dataflowId: string, dataflowUrl: string }} Created dataflow info
- */
 export async function createMagicEtlDataflow(dataflowDefinition) {
   validateDomoEnv();
   const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
@@ -601,22 +525,33 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
   const xStart = 300;
   const xStep = 200;
 
-  const manualSteps = [];
   const autoSteps = [];
+  const stepNameToTileId = {};
+  stepNameToTileId[dataflowDefinition.tableName] = inputTileId;
+
+  let manualBuildStepsCount = 0;
 
   dataflowDefinition.steps.forEach((step, i) => {
+    if (step.actionType === 'MANUAL_BUILD' || step.actionType === 'MANUAL_ACTION') {
+      console.warn(`[MAGIC ETL] Skipping manual step: ${step.stepName || step.description}`);
+      manualBuildStepsCount++;
+      return;
+    }
+
     const tileId = nextTileId('transform');
     const x = xStart + i * xStep;
     const y = 100;
-    const domoAction = mapStepToDomoAction(step, tileId, x, y, previousTileId);
-    actions.push(domoAction);
-
-    if (domoAction.type === 'ManualAction') {
-      manualSteps.push(domoAction);
-    } else {
-      autoSteps.push(domoAction);
+    const domoAction = mapStepToDomoAction(step, tileId, x, y, previousTileId, stepNameToTileId);
+    if (!domoAction) {
+      console.warn(`[MAGIC ETL] Mapped step returned null (skipping): ${step.stepName}`);
+      return;
     }
 
+    actions.push(domoAction);
+    if (step.stepName) {
+      stepNameToTileId[step.stepName] = tileId;
+    }
+    autoSteps.push(domoAction);
     previousTileId = tileId;
   });
 
@@ -626,11 +561,6 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
   actions.push(
     buildOutputAction(outputTileId, dataflowDefinition.outputDatasetName, outputX, 100, previousTileId)
   );
-
-  if (manualSteps.length > 0) {
-    console.log(`[MAGIC ETL] ${manualSteps.length} step(s) flagged as MANUAL_BUILD for '${dataflowDefinition.tableName}':`);
-    manualSteps.forEach(s => console.log(`  - ${s.name}: ${s.settings.manualDescription}`));
-  }
 
   // ── 4. Build inputs / outputs arrays ──
   const inputs = [
@@ -658,11 +588,9 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
     outputs
   );
 
-  // ── 6. Validate before submission ──
   validatePayload(payload);
 
   console.log(`[MAGIC ETL] Creating dataflow '${dataflowDefinition.dataflowName}' with ${actions.length} action(s)...`);
-  console.log(`[MAGIC ETL] Payload:`, JSON.stringify(payload, null, 2));
 
   // ── 7. Submit ──
   try {
@@ -671,8 +599,6 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
     const response = await axios.post(url, payload, { headers, timeout: 60000 });
 
     const dataflowId = response.data?.id || response.data?.dataFlowId || response.data?.dataflowId;
-    const respOutputs = response.data?.outputs || [];
-    const outputDatasetId = respOutputs[0]?.dataSourceId || respOutputs[0]?.id || respOutputs[0]?.datasetId || null;
 
     if (!dataflowId) {
       console.warn(`[MAGIC ETL] Dataflow may have been created but no ID in response:`, JSON.stringify(response.data));
@@ -686,15 +612,15 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
     }
 
     const dataflowUrl = `https://${domain}/datacenter/dataflows/${dataflowId}`;
-    console.log(`[MAGIC ETL] Dataflow created successfully. ID: ${dataflowId}, URL: ${dataflowUrl}, Output Dataset: ${outputDatasetId}`);
+    console.log(`[MAGIC ETL] Dataflow created successfully. ID: ${dataflowId}, URL: ${dataflowUrl}`);
 
     return {
       dataflowId,
       dataflowUrl,
-      outputDatasetId,
+      outputDatasetId: null, // extracted later after running & polling
       steps: dataflowDefinition.steps,
       autoMappedSteps: autoSteps.length,
-      manualBuildSteps: manualSteps.length,
+      manualBuildSteps: manualBuildStepsCount,
     };
 
   } catch (error) {
@@ -709,22 +635,79 @@ export async function createMagicEtlDataflow(dataflowDefinition) {
       error: `HTTP ${status}: ${body}`,
       steps: dataflowDefinition.steps,
       autoMappedSteps: autoSteps.length,
-      manualBuildSteps: manualSteps.length,
+      manualBuildSteps: manualBuildStepsCount,
     };
   }
 }
 
-// ─── createModelViewMagicEtl ──────────────────────────────────────────────────
+// ─── Custom createModelViewMagicEtl ──────────────────────────────────────────
 const _modelViewInFlight = new Map();
 
-/**
- * Creates a Magic ETL dataflow in Domo representing the Model View (joined relationships).
- *
- * @param {string} reportName - Power BI report name
- * @param {Array}  resolvedRels - Resolved relationships from resolveRelationships()
- * @param {object} tableToDatasetId - Map of tableName -> domoDatasetId
- * @returns {Promise<object>} Created dataflow info
- */
+function resolveColumnConflicts(leftTileId, rightTileId, rightTableName, leftKey, rightKey, jx, jy, nextTileId, actions, streamColumns, renamesPerformed) {
+  const leftCols = streamColumns[leftTileId] || new Set();
+  const rightCols = streamColumns[rightTileId] || new Set();
+
+  const conflicts = [];
+  for (const col of rightCols) {
+    const colLower = col.toLowerCase();
+    const isConflict = Array.from(leftCols).some(lc => lc.toLowerCase() === colLower);
+    if (isConflict) {
+      conflicts.push(col);
+    }
+  }
+
+  if (conflicts.length === 0) {
+    return { step2Id: rightTileId, rightKey };
+  }
+
+  const dedupTileId = nextTileId('dedup');
+  const suffix = `_${rightTableName}`;
+  const renamingFields = conflicts.map(col => ({
+    name: col,
+    rename: col + suffix
+  }));
+
+  actions.push({
+    type: 'SelectValues',
+    id: dedupTileId,
+    name: `Rename conflicting columns in ${rightTableName}`,
+    dependsOn: [rightTileId],
+    gui: { x: jx - 50, y: jy + 100 },
+    fields: renamingFields,
+    removeByDefault: false
+  });
+
+  conflicts.forEach(col => {
+    renamesPerformed.push({ original: col, renamed: col + suffix });
+  });
+
+  const renamedRightCols = new Set();
+  for (const col of rightCols) {
+    if (conflicts.includes(col)) {
+      renamedRightCols.add(col + suffix);
+    } else {
+      renamedRightCols.add(col);
+    }
+  }
+  streamColumns[dedupTileId] = renamedRightCols;
+
+  // Map right join keys if they are resolved as conflicts
+  const updatedRightKey = (Array.isArray(rightKey) ? rightKey : [rightKey]).map(key => {
+    const keyTrimmed = key.trim();
+    const keyLower = keyTrimmed.toLowerCase();
+    const conflictCol = conflicts.find(c => c.toLowerCase() === keyLower);
+    if (conflictCol) {
+      return conflictCol + suffix;
+    }
+    return keyTrimmed;
+  });
+
+  return {
+    step2Id: dedupTileId,
+    rightKey: Array.isArray(rightKey) ? updatedRightKey : updatedRightKey[0]
+  };
+}
+
 export async function createModelViewMagicEtl(reportName, resolvedRels, tableToDatasetId) {
   if (_modelViewInFlight.has(reportName)) {
     console.log(`[CONCURRENCY] A request for Model View ETL for reportName '${reportName}' is already in-flight. Awaiting it.`);
@@ -770,16 +753,20 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
       })
     );
 
-
+    const streamColumns = {};
+    uniqueTables.forEach(tableName => {
+      const tileId = tableToTileId[tableName];
+      streamColumns[tileId] = new Set(tableToColumns[tableName] || []);
+    });
 
     // ── 2. Join Tiles (MergeJoin) ──
     const joinedTables = new Set();
-    const accumulatedLeftCols = new Set();
     const remainingRels = [...validRels];
     let joinIndex = 0;
     let activeStreamId = null;
     const joinXStart = 450;
     const joinXStep = 200;
+    const renamesPerformed = [];
 
     while (remainingRels.length > 0) {
       let relIndex = -1;
@@ -810,9 +797,6 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
           joinName = `Join ${fromTable} & ${toTable}`;
           joinedTables.add(fromTable);
           joinedTables.add(toTable);
-
-          // Initialize accumulatedLeftCols with fromTable columns
-          (tableToColumns[fromTable] || []).forEach(c => accumulatedLeftCols.add(c));
 
           rightTable = toTable;
           leftTableName = fromTable;
@@ -851,8 +835,23 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
         const jy = 150 + joinIndex * 50;
 
         const isFirstJoin = activeStreamId === null;
-        const step1Id = isFirstJoin ? tableToTileId[fromTable] : activeStreamId;
-        const step2Id = tableToTileId[rightTable];
+        const step1Id = isFirstJoin ? tableToTileId[leftTableName] : activeStreamId;
+
+        const conflictRes = resolveColumnConflicts(
+          step1Id,
+          tableToTileId[rightTable],
+          rightTableName,
+          leftKey,
+          rightKey,
+          jx,
+          jy,
+          nextTileId,
+          actions,
+          streamColumns,
+          renamesPerformed
+        );
+        const step2Id = conflictRes.step2Id;
+        const resolvedRightKey = conflictRes.rightKey;
 
         actions.push(
           buildJoinAction(
@@ -860,7 +859,7 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
             joinName,
             joinType,
             leftKey,
-            rightKey,
+            resolvedRightKey,
             jx,
             jy,
             step1Id,
@@ -868,8 +867,15 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
           )
         );
 
-        // Accumulate right table's prefixed columns
-        (tableToColumns[rightTable] || []).forEach(c => accumulatedLeftCols.add(c));
+        const leftCols = streamColumns[step1Id] || new Set();
+        const rightColsForJoin = streamColumns[step2Id] || new Set();
+        streamColumns[joinTileId] = new Set([...leftCols, ...rightColsForJoin]);
+
+        for (const table of uniqueTables) {
+          if (tableToTileId[table] === step1Id || tableToTileId[table] === tableToTileId[rightTable]) {
+            tableToTileId[table] = joinTileId;
+          }
+        }
 
         activeStreamId = joinTileId;
         joinIndex++;
@@ -886,26 +892,40 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
         const leftKey = rel.fromColumn;
         const rightKey = rel.toColumn;
 
+        const subConflictRes = resolveColumnConflicts(
+          tableToTileId[fromTable],
+          tableToTileId[toTable],
+          toTable,
+          leftKey,
+          rightKey,
+          sjx,
+          350,
+          nextTileId,
+          actions,
+          streamColumns,
+          renamesPerformed
+        );
+        const subStep2Id = subConflictRes.step2Id;
+        const subResolvedRightKey = subConflictRes.rightKey;
+
         actions.push(
           buildJoinAction(
             subJoinTileId,
             `Join ${fromTable} & ${toTable} (Sub-branch)`,
             'INNER',
             leftKey,
-            rightKey,
+            subResolvedRightKey,
             sjx,
             350,
             tableToTileId[fromTable],
-            tableToTileId[toTable]
+            subStep2Id
           )
         );
-        joinIndex++;
 
-        // Compute sub-branch output columns (no prefixing, no collisions)
-        const subBranchCols = [
-          ...(tableToColumns[fromTable] || []),
-          ...(tableToColumns[toTable] || [])
-        ];
+        const fromCols = streamColumns[tableToTileId[fromTable]] || new Set();
+        const subRightCols = streamColumns[subStep2Id] || new Set();
+        streamColumns[subJoinTileId] = new Set([...fromCols, ...subRightCols]);
+        joinIndex++;
 
         const mergeJoinTileId = nextTileId('join-merge');
         const mjx = joinXStart + joinIndex * joinXStep;
@@ -913,27 +933,78 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
         const leftMergeKey = rel.fromColumn;
         const rightMergeKey = rel.fromColumn;
 
+        const mergeConflictRes = resolveColumnConflicts(
+          activeStreamId,
+          subJoinTileId,
+          toTable,
+          leftMergeKey,
+          rightMergeKey,
+          mjx,
+          250,
+          nextTileId,
+          actions,
+          streamColumns,
+          renamesPerformed
+        );
+        const mergeStep2Id = mergeConflictRes.step2Id;
+        const mergeResolvedRightKey = mergeConflictRes.rightKey;
+
         actions.push(
           buildJoinAction(
             mergeJoinTileId,
             'Merge Disjoint Branches',
             'LEFT',
             leftMergeKey,
-            rightMergeKey,
+            mergeResolvedRightKey,
             mjx,
             250,
             activeStreamId,
-            subJoinTileId
+            mergeStep2Id
           )
         );
 
-        // Accumulate sub-branch columns
-        subBranchCols.forEach(c => accumulatedLeftCols.add(c));
+        const leftCols = streamColumns[activeStreamId] || new Set();
+        const mergeRightCols = streamColumns[mergeStep2Id] || new Set();
+        streamColumns[mergeJoinTileId] = new Set([...leftCols, ...mergeRightCols]);
 
         joinedTables.add(fromTable);
         joinedTables.add(toTable);
         activeStreamId = mergeJoinTileId;
         joinIndex++;
+      }
+    }
+
+    // Cleanup tile per RULE 7C using rightTableName suffix
+    const columnRenameMap = {};
+    if (activeStreamId && renamesPerformed.length > 0) {
+      const finalCols = Array.from(streamColumns[activeStreamId] || []);
+      const nextFinalCols = new Set(finalCols);
+      const cleanupRenames = [];
+
+      for (const { original, renamed } of renamesPerformed) {
+        if (nextFinalCols.has(renamed) && !nextFinalCols.has(original)) {
+          cleanupRenames.push({ name: renamed, rename: original });
+          nextFinalCols.delete(renamed);
+          nextFinalCols.add(original);
+        } else {
+          columnRenameMap[original] = renamed;
+        }
+      }
+
+      if (cleanupRenames.length > 0) {
+        const cleanupTileId = nextTileId('cleanup');
+        const outputX = joinXStart + joinIndex * joinXStep;
+        actions.push({
+          type: 'SelectValues',
+          id: cleanupTileId,
+          name: 'Cleanup column names',
+          dependsOn: [activeStreamId],
+          gui: { x: outputX - 100, y: 200 },
+          fields: cleanupRenames,
+          removeByDefault: false,
+        });
+        streamColumns[cleanupTileId] = nextFinalCols;
+        activeStreamId = cleanupTileId;
       }
     }
 
@@ -971,11 +1042,7 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
       outputs
     );
 
-    // ── 6. Validate before submission ──
     validatePayload(payload);
-
-    // console.log(`[MAGIC ETL MODEL VIEW] Creating dataflow '${dataflowName}' with ${actions.length} action(s)...`);
-    // console.log(`[MAGIC ETL MODEL VIEW] Payload:`, JSON.stringify(payload, null, 2));
 
     // ── 7. Submit ──
     try {
@@ -992,18 +1059,17 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
           dataflowUrl: null,
           outputDatasetId: null,
           response: response.data,
+          columnRenameMap
         };
       }
 
-      // Run and poll the dataflow
       console.log(`[MAGIC ETL MODEL VIEW] Running and polling dataflow ${dataflowId}...`);
-      const { executionId } = await runMagicEtlDataflow(dataflowId);
-      const execResult = await pollEtlExecution(dataflowId, executionId);
-      if (!execResult.succeeded) {
-        throw new Error(`Model View ETL execution failed: ${execResult.error}`);
-      }
+      // const { executionId } = await runMagicEtlDataflow(dataflowId);
+      // const execResult = await pollEtlExecution(dataflowId, executionId);
+      // if (!execResult.succeeded) {
+      //   throw new Error(`Model View ETL execution failed: ${execResult.error}`);
+      // }
 
-      // Fetch details to extract outputDatasetId
       const detailUrl = `https://${domain}/api/dataprocessing/v1/dataflows/${dataflowId}`;
       const detailResponse = await axios.get(detailUrl, { headers, timeout: 30000 });
       const respOutputs = detailResponse.data?.outputs || [];
@@ -1021,6 +1087,7 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
         dataflowUrl,
         outputDatasetId,
         joinCount: joinIndex,
+        columnRenameMap
       };
 
     } catch (error) {
@@ -1040,12 +1107,6 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
   }
 }
 
-/**
- * Triggers execution of a Magic ETL dataflow in Domo.
- *
- * @param {string} dataflowId - The ID of the dataflow to run
- * @returns {Promise<{ executionId: string }>} Triggered execution ID
- */
 export async function runMagicEtlDataflow(dataflowId) {
   validateDomoEnv();
   const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
@@ -1064,14 +1125,6 @@ export async function runMagicEtlDataflow(dataflowId) {
   });
 }
 
-/**
- * Polls the execution status of a Magic ETL dataflow in Domo until completion.
- *
- * @param {string} dataflowId - The ID of the dataflow
- * @param {string} executionId - The ID of the execution to monitor
- * @param {number} maxWaitTimeMs - Maximum time to wait in milliseconds
- * @returns {Promise<{ succeeded: boolean, status: string, error?: string }>} Execution result
- */
 export async function pollEtlExecution(dataflowId, executionId, maxWaitTimeMs = 300000) {
   validateDomoEnv();
   const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
@@ -1083,7 +1136,7 @@ export async function pollEtlExecution(dataflowId, executionId, maxWaitTimeMs = 
   console.log(`[MAGIC ETL POLL] Polling execution status for dataflow ${dataflowId}, execution ${executionId}`);
 
   const startTime = Date.now();
-  const interval = 5000; // Poll every 5 seconds
+  const interval = 5000;
 
   while (Date.now() - startTime < maxWaitTimeMs) {
     try {
@@ -1108,7 +1161,6 @@ export async function pollEtlExecution(dataflowId, executionId, maxWaitTimeMs = 
 
     } catch (err) {
       console.error(`[MAGIC ETL POLL] Error fetching execution status: ${err.message}`);
-      // Do not throw or terminate polling on transient HTTP failures, retry next time
     }
 
     await new Promise(resolve => setTimeout(resolve, interval));

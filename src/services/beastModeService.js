@@ -183,6 +183,9 @@ export async function createBeastModeFunction(domain, token, ownerId, measure) {
  * @returns {Promise<object>} API response data
  */
 export async function createBeastModeFunctionsBulk(domain, token, ownerId, measures) {
+  // Bulk upload disabled per request; using single upload API instead.
+  throw new Error('Bulk upload beast mode is disabled.');
+  /*
   if (!measures || measures.length === 0) {
     console.log('[BEAST MODE SERVICE] No measures to create in bulk — skipping.');
     return { created: [] };
@@ -248,6 +251,7 @@ export async function createBeastModeFunctionsBulk(domain, token, ownerId, measu
     if (bulkError.response) newError.response = bulkError.response;
     throw newError;
   }
+  */
 }
 
 async function findBadFormulas(domain, token, ownerId, measures, headers, url) {
