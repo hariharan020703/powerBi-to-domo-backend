@@ -95,8 +95,23 @@ function buildLoadAction(id, name, dataSourceId, x, y) {
     type: 'LoadFromVault',
     id,
     name,
+    disabled: false,
+    removeByDefault: false,
+    notes: [],
+    settings: { preferredDatabaseEntityType: 'TEMP_VIEW' },
     dataSourceId,
-    gui: { x, y }
+    executeFlowWhenUpdated: false,
+    onlyLoadNewVersions: false,
+    recentVersionCutoffMs: 0,
+    columnSettings: {},
+    visiblePartitionColumn: '',
+    versionWindow: null,
+    previewRowLimit: 10000,
+    propagateAi: false,
+    filterGroupIds: [],
+    sourceType: 'AUTO',
+    filterPolicy: 'LEGACY',
+    gui: { id, type: 'Tile', x, y, color: null, colorSource: null },
   };
 }
 
@@ -105,37 +120,74 @@ function buildOutputAction(id, name, x, y, dependsOnId) {
     type: 'PublishToVault',
     id,
     name,
-    dataSourceName: name,
     dependsOn: [dependsOnId],
-    settings: {
-      "selectAction": name
-    },
-    gui: { x, y },
+    disabled: false,
+    removeByDefault: false,
+    notes: [],
+    settings: { preferredDatabaseEntityType: 'TEMP_VIEW' },
+    dataSource: { cloudId: null, name },
     versionChainType: 'REPLACE',
-    schemaSource: 'DATAFLOW',
-    partitioned: false,
+    partitionIdColumns: [],
+    upsertColumns: [],
+    retainPartitionExpression: '',
+    gui: { id, type: 'Tile', x, y, color: null, colorSource: null },
+    previewRowLimit: null,
   };
 }
 
-function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, step2Id) {
+/**
+ * Build a MergeJoin action matching Domo's native ETL JSON structure.
+ * @param {string}   id          - Unique tile ID
+ * @param {string}   name        - Display name
+ * @param {string}   joinType    - JOIN type (INNER, LEFT OUTER, FULL OUTER)
+ * @param {string|string[]} leftKey  - Left join key column(s)
+ * @param {string|string[]} rightKey - Right join key column(s)
+ * @param {number}   x           - GUI x position
+ * @param {number}   y           - GUI y position
+ * @param {string}   step1Id     - Left input tile ID
+ * @param {string}   step2Id     - Right input tile ID
+ * @param {string}   [rightTableName] - Name of the right table (for renaming conflicting columns)
+ */
+function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, step2Id, rightTableName, relationshipType = 'MTM') {
   const domoJoinType = joinType === 'LEFT' || joinType === 'LEFT OUTER' ? 'LEFT OUTER'
     : joinType === 'INNER' ? 'INNER'
       : joinType === 'FULL' || joinType === 'FULL OUTER' ? 'FULL OUTER'
-        : 'LEFT OUTER';
+        : joinType === 'RIGHT' || joinType === 'RIGHT OUTER' ? 'RIGHT OUTER'
+          : 'LEFT OUTER';
+
+  const keys1 = Array.isArray(leftKey) ? leftKey : [leftKey];
+  const keys2 = Array.isArray(rightKey) ? rightKey : [rightKey];
+
+  const schemaModification2 = [];
+  for (let i = 0; i < keys2.length; i++) {
+    const rk = keys2[i];
+    const lk = keys1[i] || keys1[0];
+    if (rk === lk) {
+      const prefix = rightTableName || step2Id;
+      schemaModification2.push({ name: rk, rename: `${prefix}.${rk}`, remove: false });
+    }
+  }
 
   return {
     type: 'MergeJoin',
     id,
     name,
     dependsOn: [step1Id, step2Id],
-    settings: {},
-    gui: { x, y },
+    disabled: false,
+    removeByDefault: false,
+    notes: [],
+    settings: { preferredDatabaseEntityType: 'TEMP_VIEW' },
     joinType: domoJoinType,
-    relationshipType: 'MANY_TO_MANY',
     step1: step1Id,
     step2: step2Id,
-    keys1: Array.isArray(leftKey) ? leftKey : [leftKey],
-    keys2: Array.isArray(rightKey) ? rightKey : [rightKey],
+    keys1,
+    keys2,
+    on: null,
+    schemaModification1: [],
+    schemaModification2,
+    relationshipType,
+    gui: { id, type: 'Tile', x, y, color: null, colorSource: null },
+    previewRowLimit: null,
   };
 }
 
@@ -708,6 +760,25 @@ function resolveColumnConflicts(leftTileId, rightTileId, rightTableName, leftKey
   };
 }
 
+function mapCardinalityToJoinConfig(fromCardinality, toCardinality) {
+  const from = (fromCardinality || '').toLowerCase();
+  const to = (toCardinality || '').toLowerCase();
+
+  if (from === 'one' && to === 'one') {
+    return { relationshipType: 'OTO', joinType: 'INNER' };
+  }
+  if (from === 'one' && to === 'many') {
+    // fromTable is the "1" side — preserve all its rows
+    return { relationshipType: 'OTM', joinType: 'LEFT OUTER' };
+  }
+  if (from === 'many' && to === 'one') {
+    // fromTable is the "many" side — each row should match exactly one
+    return { relationshipType: 'MTO', joinType: 'INNER' };
+  }
+  // many-to-many, or unknown/unspecified cardinality
+  return { relationshipType: 'MTM', joinType: 'INNER' };
+}
+
 export async function createModelViewMagicEtl(reportName, resolvedRels, tableToDatasetId) {
   if (_modelViewInFlight.has(reportName)) {
     console.log(`[CONCURRENCY] A request for Model View ETL for reportName '${reportName}' is already in-flight. Awaiting it.`);
@@ -823,12 +894,7 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
           }
         }
 
-        let joinType = 'INNER';
-        if (rel.crossFilter === 'BothDirections') {
-          joinType = 'LEFT';
-        } else if (rel.crossFilter === 'OneDirection') {
-          joinType = rel.fromCardinality === 'One' ? 'LEFT' : 'INNER';
-        }
+        const { relationshipType, joinType } = mapCardinalityToJoinConfig(rel.fromCardinality, rel.toCardinality);
 
         const joinTileId = nextTileId('join');
         const jx = joinXStart + joinIndex * joinXStep;
@@ -863,7 +929,9 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
             jx,
             jy,
             step1Id,
-            step2Id
+            step2Id,
+            rightTableName,
+            relationshipType
           )
         );
 
@@ -885,6 +953,19 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
         const rel = remainingRels.shift();
         const fromTable = rel.fromTable;
         const toTable = rel.toTable;
+
+        // Skip redundant relationships — both tables already merged into the
+        // same stream via an earlier join, so this edge is already satisfied.
+        if (
+          tableToTileId[fromTable] &&
+          tableToTileId[toTable] &&
+          tableToTileId[fromTable] === tableToTileId[toTable]
+        ) {
+          console.warn(
+            `[MODEL VIEW] Skipping redundant relationship ${fromTable} <-> ${toTable}: both tables already joined into the same stream.`
+          );
+          continue;
+        }
 
         const subJoinTileId = nextTileId('join-sub');
         const sjx = joinXStart + joinIndex * joinXStep;
@@ -918,7 +999,8 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
             sjx,
             350,
             tableToTileId[fromTable],
-            subStep2Id
+            subStep2Id,
+            toTable
           )
         );
 
@@ -959,7 +1041,8 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
             mjx,
             250,
             activeStreamId,
-            mergeStep2Id
+            mergeStep2Id,
+            toTable
           )
         );
 
@@ -1064,11 +1147,11 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
       }
 
       console.log(`[MAGIC ETL MODEL VIEW] Running and polling dataflow ${dataflowId}...`);
-      // const { executionId } = await runMagicEtlDataflow(dataflowId);
-      // const execResult = await pollEtlExecution(dataflowId, executionId);
-      // if (!execResult.succeeded) {
-      //   throw new Error(`Model View ETL execution failed: ${execResult.error}`);
-      // }
+      const { executionId } = await runMagicEtlDataflow(dataflowId);
+      const execResult = await pollEtlExecution(dataflowId, executionId);
+      if (!execResult.succeeded) {
+        throw new Error(`Model View ETL execution failed: ${execResult.error}`);
+      }
 
       const detailUrl = `https://${domain}/api/dataprocessing/v1/dataflows/${dataflowId}`;
       const detailResponse = await axios.get(detailUrl, { headers, timeout: 30000 });

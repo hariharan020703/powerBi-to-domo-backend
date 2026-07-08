@@ -1,11 +1,6 @@
 import axios from 'axios';
-import { getAutomatedDomoCookie, resetDomoCookieCache, getCachedCsrfToken, getCachedRequestContext } from './domoCookieService.js';
 
 const API_TIMEOUT_MS = 30_000;
-const OAUTH_TIMEOUT_MS = 20_000;
-
-let _cachedToken = null;
-let _tokenExpiresAt = 0;
 
 async function requestWithRetry(requestFn, maxRetries = 3) {
   let attempt = 0;
@@ -24,120 +19,226 @@ async function requestWithRetry(requestFn, maxRetries = 3) {
   }
 }
 
-async function fetchOAuthToken() {
-  const now = Date.now();
-  if (_cachedToken && now < _tokenExpiresAt) {
-    console.log('[CARD SERVICE] Using cached OAuth access token.');
-    return _cachedToken;
-  }
-
-  const clientId = (process.env.DOMO_CLIENT_ID || '').trim();
-  const clientSecret = (process.env.DOMO_CLIENT_SECRET || '').trim();
-
-  if (!clientId || !clientSecret) {
-    console.warn('[CARD SERVICE] DOMO_CLIENT_ID / DOMO_CLIENT_SECRET not set.');
-    return null;
-  }
-
-  console.log('[CARD SERVICE] Fetching OAuth access token using client credentials...');
-  try {
-    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-    const tokenRes = await axios.get(
-      'https://api.domo.com/oauth/token?grant_type=client_credentials&scope=data%20dashboard%20user',
-      {
-        headers: { Authorization: `Basic ${basicAuth}` },
-        timeout: OAUTH_TIMEOUT_MS,
-      }
-    );
-    if (tokenRes.data?.access_token) {
-      _cachedToken = tokenRes.data.access_token;
-      _tokenExpiresAt = now + 55 * 60 * 1000; // cache 55 min (token lasts 60)
-      console.log('[CARD SERVICE] Successfully obtained OAuth access token.');
-      return _cachedToken;
-    }
-    console.warn('[CARD SERVICE] OAuth response missing access_token field.');
-    return null;
-  } catch (err) {
-    console.error('[CARD SERVICE] Failed to fetch OAuth access token:', err.message);
-    return null;
-  }
-}
-
-function buildCardBody({ cardName, domoDatasetId, columns, beastModeIds }) {
+function buildCardBody({ cardName, domoDatasetId, columns, beastModeIds, chartType }) {
   const cols = columns || [];
+  let resolvedChartType = chartType || 'badge_vert_stackedbar';
+  const isTable = resolvedChartType === 'badge_basic_table';
+  const isSingleValue = resolvedChartType === 'badge_singlevalue' || resolvedChartType === 'badge_single_value';
+  const isGauge = resolvedChartType === 'badge_filledgauge' || resolvedChartType === 'badge_filled_gauge';
 
-  const isNumericType = (t) =>
-    ['LONG', 'DOUBLE', 'DECIMAL', 'INTEGER', 'NUMERIC'].includes((t || '').toUpperCase());
-  const isDateType = (t) =>
-    ['DATE', 'DATETIME'].includes((t || '').toUpperCase());
-  const isStringType = (t) =>
-    !isNumericType(t) && !isDateType(t);
-
-  // ── Pick category column: prefer STRING, fallback to DATE/DATETIME ─────────
-  const categoryCol =
-    cols.find(c => isStringType(c.type)) ||
-    cols.find(c => isDateType(c.type)) ||
-    cols[0] ||
-    { name: 'id', type: 'STRING' };
-
-  // ── Pick measure column: first numeric column that isn't the category ──────
-  const measureCol = cols.find(c => isNumericType(c.type) && c.name !== categoryCol.name);
-
-  // ── Build the measure subscription column ───────────────────────────────────
-  let measureColumnDef;
-  if (measureCol) {
-    measureColumnDef = {
-      column: measureCol.name,
-      mapping: 'VALUE',
-      aggregation: 'SUM',
-    };
-  } else {
-    // No numeric column available — fall back to counting rows via the category column
-    measureColumnDef = {
-      column: categoryCol.name,
-      mapping: 'VALUE',
-      aggregation: 'COUNT',
-    };
+  if (isGauge) {
+    resolvedChartType = 'badge_filledgauge';
+  }
+  if (isSingleValue) {
+    resolvedChartType = 'badge_singlevalue';
   }
 
-  const categoryColumnDef = {
-    column: categoryCol.name,
-    mapping: 'ITEM',
-    ...(isDateType(categoryCol.type) ? { calendar: true } : {}),
-  };
+  let subscriptionColumns;
+  let groupBy = [];
+  let projection = false;
+  let dateGrain = null;
 
-  // ── Append beast mode calculated fields as additional measures ─────────────
+  // ── Handle single-value / gauge charts (KPI, Card, Gauge visuals) ──────────
+  if (isSingleValue || isGauge) {
+    if (cols.length > 0 && cols[0].mapping) {
+      // Pre-mapped columns from layout parser — use as-is (except TREND columns in columns array)
+      subscriptionColumns = cols
+        .filter(c => c.mapping !== 'TREND')
+        .map(c => ({
+          column: c.column,
+          mapping: c.mapping || 'VALUE',
+          ...(c.aggregation && c.aggregation !== 'NONE' ? { aggregation: c.aggregation } : {}),
+          ...(c.calendar ? { calendar: true } : {}),
+        }));
+    } else if (cols.length > 0) {
+      // Auto-detect: use first numeric column or fallback to COUNT
+      if (isGauge) {
+        subscriptionColumns = [
+          {
+            column: cols[0].name,
+            mapping: 'CURRENT',
+            aggregation: 'COUNT',
+          },
+          {
+            column: (cols[1] || cols[0]).name,
+            mapping: 'TARGET',
+            aggregation: 'COUNT',
+          }
+        ];
+      } else {
+        const isNumericType = (t) =>
+          ['LONG', 'DOUBLE', 'DECIMAL', 'INTEGER', 'NUMERIC'].includes((t || '').toUpperCase());
+        const numCol = cols.find(c => isNumericType(c.type));
+        subscriptionColumns = [{
+          column: (numCol || cols[0]).name,
+          mapping: 'VALUE',
+          aggregation: numCol ? 'SUM' : 'COUNT',
+        }];
+      }
+    } else {
+      // No physical columns — Beast Mode columns will be added below
+      subscriptionColumns = [];
+    }
+    // Single-value cards: no groupBy, no dateGrain, no projection
+    groupBy = [];
+    projection = false;
+
+    // Set dateGrain if trend/date column is present
+    const dateCol = cols.find(c => c.calendar || c.mapping === 'TREND' || c.type === 'DATE' || c.type === 'DATETIME');
+    if (dateCol) {
+      dateGrain = { column: dateCol.column || dateCol.name };
+    }
+
+    // ── Handle case where no physical columns but Beast Mode IDs exist ─────────
+  } else if (cols.length === 0 && beastModeIds && beastModeIds.length > 0) {
+    // Beast Mode-only visual — physical subscription is empty, Beast Mode columns added below
+    subscriptionColumns = [];
+    groupBy = [];
+    projection = false;
+
+  } else if (cols.length > 0 && cols[0].mapping) {
+    if (!isTable) {
+      const itemCols = cols.filter(c => c.mapping === 'ITEM' || c.mapping === 'SERIES');
+      const seenValueCols = new Set();
+      const valueCols = cols.filter(c => {
+        if (c.mapping !== 'VALUE') return false;
+        if (seenValueCols.has(c.column)) return false;
+        seenValueCols.add(c.column);
+        return true;
+      });
+
+      // groupBy must contain all ITEM and SERIES columns
+      groupBy = itemCols.map(c => ({
+        column: c.column,
+        ...(c.calendar ? { calendar: true } : {}),
+      }));
+
+      // dateGrain for date-based ITEM columns
+      const dateItemCol = itemCols.find(c => c.calendar);
+      if (dateItemCol) {
+        dateGrain = { column: dateItemCol.column, dateTimeElement: 'MONTH' };
+      }
+
+      // Build subscription columns — ITEM/SERIES columns have no aggregation
+      subscriptionColumns = [
+        ...itemCols.map(c => ({
+          column: c.column,
+          mapping: c.mapping,
+          ...(c.calendar ? { calendar: true } : {}),
+        })),
+        ...valueCols.map(c => ({
+          column: c.column,
+          mapping: 'VALUE',
+          aggregation: c.aggregation || 'SUM',
+        })),
+      ];
+    } else {
+      // Table — all columns as VALUE, no aggregation
+      subscriptionColumns = cols.map(c => ({
+        column: c.column,
+        mapping: 'VALUE',
+      }));
+    }
+    projection = isTable;
+  } else {
+    // Auto-detect from column types (fallback for existing dataset-migration flow)
+    const isNumericType = (t) =>
+      ['LONG', 'DOUBLE', 'DECIMAL', 'INTEGER', 'NUMERIC'].includes((t || '').toUpperCase());
+    const isDateType = (t) =>
+      ['DATE', 'DATETIME'].includes((t || '').toUpperCase());
+
+    const categoryCol =
+      cols.find(c => !isNumericType(c.type) && !isDateType(c.type)) ||
+      cols.find(c => isDateType(c.type)) ||
+      cols[0] ||
+      { name: 'id', type: 'STRING' };
+
+    const measureCol = cols.find(c => isNumericType(c.type) && c.name !== categoryCol.name);
+
+    const categoryColumnDef = {
+      column: categoryCol.name,
+      mapping: isTable ? 'VALUE' : 'ITEM',
+      ...(isDateType(categoryCol.type) ? { calendar: true } : {}),
+    };
+
+    const measureColumnDef = measureCol
+      ? { column: measureCol.name, mapping: 'VALUE', aggregation: 'SUM' }
+      : { column: categoryCol.name, mapping: 'VALUE', aggregation: 'COUNT' };
+
+    subscriptionColumns = isTable
+      ? cols.map(c => ({ column: c.name, mapping: 'VALUE' }))
+      : [categoryColumnDef, measureColumnDef];
+
+    if (!isTable) {
+      groupBy = [{ column: categoryCol.name }];
+      if (isDateType(categoryCol.type)) {
+        dateGrain = { column: categoryCol.name, dateTimeElement: 'DAY' };
+      }
+    }
+    projection = isTable;
+  }
+
   const beastModeColumns = (beastModeIds || [])
     .filter(Boolean)
-    .map(id => ({
-      column: id.startsWith('calculation_') ? id : `calculation_${id}`,
-      mapping: 'VALUE',
-      aggregation: 'SUM',
-    }));
-
-  const allColumns = [categoryColumnDef, measureColumnDef, ...beastModeColumns];
+    .map(id => {
+      const colName = id.startsWith('calculation_') ? id : `calculation_${id}`;
+      const alreadySubscribed = (subscriptionColumns || []).some(c => c.column === colName);
+      if (alreadySubscribed) return null;
+      return {
+        column: colName,
+        mapping: 'VALUE',
+      };
+    })
+    .filter(Boolean);
 
   const subscriptionBody = {
     name: 'main',
-    columns: allColumns,
+    columns: [...subscriptionColumns, ...beastModeColumns],
     filters: [],
     orderBy: [],
-    groupBy: [{ column: categoryCol.name, ...(isDateType(categoryCol.type) ? { calendar: true } : {}) }],
+    groupBy,
     fiscal: false,
-    projection: false,
+    projection,
     distinct: false,
   };
 
-  // dateGrain is required when the category column is a date for proper bucketing
-  if (isDateType(categoryCol.type)) {
-    subscriptionBody.dateGrain = { column: categoryCol.name, dateTimeElement: 'DAY' };
+  if (dateGrain) subscriptionBody.dateGrain = dateGrain;
+
+  const subscriptions = { main: subscriptionBody };
+
+  // Add big_number subscription for KPI/trendline/bar/line/pie/funnel/waterfall charts
+  const showSummaryNumber = !isTable && !isGauge;
+  if (showSummaryNumber) {
+    const valCol = [...subscriptionColumns, ...beastModeColumns].find(
+      c => c.mapping === 'VALUE'
+    );
+    if (valCol) {
+      const isBeast = valCol.column.startsWith('calculation_');
+      const cleanAlias = isBeast ? 'Value' : valCol.column;
+      const agg = valCol.aggregation || 'SUM';
+      subscriptions.big_number = {
+        name: 'big_number',
+        columns: [
+          {
+            column: valCol.column,
+            aggregation: agg,
+            alias: `${agg.charAt(0) + agg.slice(1).toLowerCase()} of ${cleanAlias}`,
+            format: {
+              format: '#A',
+              type: 'abbreviated',
+            },
+          },
+        ],
+        filters: [],
+      };
+    }
   }
+
+  const hasNoDateRange = !(isGauge || isSingleValue);
 
   return {
     definition: {
-      subscriptions: {
-        main: subscriptionBody,
-      },
+      subscriptions,
       formulas: { dsUpdated: [], dsDeleted: [], card: [] },
       annotations: { new: [], modified: [], deleted: [] },
       conditionalFormats: { card: [], datasource: [] },
@@ -146,58 +247,40 @@ function buildCardBody({ cardName, domoDatasetId, columns, beastModeIds }) {
       charts: {
         main: {
           component: 'main',
-          chartType: 'badge_vert_stackedbar',
+          chartType: resolvedChartType,
           overrides: {},
           goal: null,
         },
       },
-      dynamicTitle: {
-        text: [{ text: cardName, type: 'TEXT' }],
-      },
-      dynamicDescription: {
-        text: [],
-        displayOnCardDetails: true,
-      },
+      dynamicTitle: { text: [{ text: cardName, type: 'TEXT' }] },
+      dynamicDescription: { text: [], displayOnCardDetails: true },
       chartVersion: '12',
+      includeEmptyFilters: true,
+      ...(hasNoDateRange ? { noDateRange: true } : {}),
       inputTable: false,
       title: cardName,
       description: 'Migrated from Power BI',
     },
-    dataProvider: {
-      dataSourceId: domoDatasetId,
-    },
+    dataProvider: { dataSourceId: domoDatasetId },
     variables: true,
+    columns: false,
   };
 }
 
-export async function createDomoCard(domain, token, { cardName, domoDatasetId, columns, beastModeIds, ownerId }) {
-  const cookie = await getAutomatedDomoCookie();
-
-  if (!cookie) {
-    const msg = '[CARD SERVICE] Could not obtain Domo session cookie automatically.';
-    console.error(msg);
-    return { cardId: null, cardUrl: null, error: msg };
-  }
-
-  const csrfToken = getCachedCsrfToken();
-  const requestContext = getCachedRequestContext();
-
-  if (!csrfToken || !requestContext) {
-    const msg = '[CARD SERVICE] Missing csrf-token or request-context — cannot create card.';
-    console.error(msg);
-    return { cardId: null, cardUrl: null, error: msg };
-  }
-
-  const cardBody = buildCardBody({ cardName, domoDatasetId, columns, beastModeIds });
+export async function createDomoCard(domain, token, options) {
+  const { cardName, domoDatasetId, columns, beastModeIds, ownerId } = options;
+  const cardBody = buildCardBody({ cardName, domoDatasetId, columns, beastModeIds, chartType: options.chartType });
+  console.log(`[CARD BODY DEBUG] "${cardName}" full request body:`, JSON.stringify(cardBody));
 
   const headers = {
     'Content-Type': 'application/json',
-    'Cookie': cookie,
-    'x-csrf-token': csrfToken,
-    'x-domo-requestcontext': requestContext,
+    'X-DOMO-Developer-Token': token || (process.env.DOMO_CLIENT_TOKEN || '').trim()
   };
 
-  const url = `https://${domain}/api/content/v3/cards/kpi`;
+  let url = `https://${domain}/api/content/v3/cards/kpi`;
+  if (options.pageId) {
+    url += `?pageId=${options.pageId}`;
+  }
   console.log(`[CARD SERVICE] Creating card "${cardName}" via v3 instance API`);
 
   try {
@@ -224,15 +307,9 @@ export async function createDomoCard(domain, token, { cardName, domoDatasetId, c
     const detail = JSON.stringify(err.response?.data ?? err.message);
     console.error(`[CARD SERVICE] Card creation failed (HTTP ${status ?? 'N/A'}): ${detail}`);
 
-    if (status === 401 || status === 403) {
-      console.error('[CARD SERVICE] Cookie/csrf likely expired. Will re-login on next attempt.');
-      resetDomoCookieCache();
-    }
-
     return { cardId: null, cardUrl: null, error: `Card creation failed: HTTP ${status ?? 'N/A'} — ${detail}` };
   }
 }
-
 
 export async function createDomoPage(domain, token, { pageName, ownerId }) {
   const headers = {
@@ -278,20 +355,9 @@ export async function addCardsToPage(domain, token, pageId, cardIds) {
     return false;
   }
 
-  const cookie = await getAutomatedDomoCookie();
-  const csrfToken = getCachedCsrfToken();
-  const requestContext = getCachedRequestContext();
-
-  if (!cookie || !csrfToken) {
-    console.error('[CARD SERVICE] addCardsToPage: missing auth session.');
-    return false;
-  }
-
   const headers = {
     'Content-Type': 'application/json',
-    'Cookie': cookie,
-    'x-csrf-token': csrfToken,
-    'x-domo-requestcontext': requestContext,
+    'X-DOMO-Developer-Token': token || (process.env.DOMO_CLIENT_TOKEN || '').trim()
   };
 
   console.log(`[CARD SERVICE] Adding ${validCardIds.length} card(s) to page ${pageId}...`);
@@ -316,172 +382,4 @@ export async function addCardsToPage(domain, token, pageId, cardIds) {
     console.log(`[CARD SERVICE] Success: Added all cards to page ${pageId}`);
   }
   return allSucceeded;
-}
-
-export async function getCardDetails(domain, token, cardId) {
-  const headers = {
-    'Content-Type': 'application/json',
-    'X-DOMO-DEVELOPER-TOKEN': token,
-  };
-  console.log(`[CARD SERVICE] Getting details for card ${cardId}...`);
-  return requestWithRetry(async () => {
-    const response = await axios.get(
-      `https://${domain}/api/content/v1/cards/${cardId}`,
-      { headers, timeout: API_TIMEOUT_MS }
-    );
-    return response.data;
-  });
-}
-
-export async function debugCardCreation(domain, token, datasetId) {
-  const accessToken = await fetchOAuthToken();
-  if (!accessToken) return { error: 'No OAuth token available' };
-
-  const oauthHeaders = {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${accessToken}`,
-  };
-
-  const results = {};
-
-  // ── Probe 1: List existing cards from public API to see the structure ──────
-  try {
-    const listRes = await axios.get('https://api.domo.com/v1/cards?limit=5', {
-      headers: oauthHeaders, timeout: 15000, validateStatus: () => true,
-    });
-    results.publicCardList = {
-      status: listRes.status,
-      fullResponse: JSON.stringify(listRes.data),
-    };
-    console.log('[DEBUG] Public API cards list: HTTP', listRes.status);
-    console.log('[DEBUG] FULL response:', JSON.stringify(listRes.data));
-  } catch (e) {
-    results.publicCardListError = e.message;
-  }
-
-  // ── Probe 1b: Try metadata endpoint for chart types ────────────────────────
-  try {
-    const metaRes = await axios.get('https://api.domo.com/v1/cards/charttype', {
-      headers: oauthHeaders, timeout: 10000, validateStatus: () => true,
-    }).catch(() => null);
-    if (metaRes) {
-      console.log('[DEBUG] charttype endpoint: HTTP', metaRes.status, JSON.stringify(metaRes.data)?.slice(0, 500));
-    }
-  } catch (e) { }
-
-  // ── Probe 1c: Fetch ONE specific existing card's full structure (not list) ──
-  try {
-    const oneCardRes = await axios.get('https://api.domo.com/v1/cards/485997809', {
-      headers: oauthHeaders, timeout: 10000, validateStatus: () => true,
-    });
-    console.log('[DEBUG] Single card fetch: HTTP', oneCardRes.status);
-    console.log('[DEBUG] Single card FULL response:', JSON.stringify(oneCardRes.data));
-    results.singleCard = { status: oneCardRes.status, data: oneCardRes.data };
-  } catch (e) {
-    results.singleCardError = e.message;
-  }
-
-  // ── Probe 2: Try different body formats on POST /v1/cards/chart ───────────
-  const chartUrl = 'https://api.domo.com/v1/cards/chart';
-
-  const attempts = [
-    // Try A: Uppercase TABLE
-    {
-      name: 'uppercase_TABLE',
-      body: {
-        name: 'Debug API Card TABLE',
-        description: 'Created via API',
-        dataSetId: datasetId,
-        chartType: 'TABLE',
-      },
-    },
-    // Try B: Uppercase BASIC_TABLE
-    {
-      name: 'uppercase_BASIC_TABLE',
-      body: {
-        name: 'Debug API Card BASIC_TABLE',
-        description: 'Created via API',
-        dataSetId: datasetId,
-        chartType: 'BASIC_TABLE',
-      },
-    },
-    // Try C: Uppercase BADGE_BASIC_TABLE
-    {
-      name: 'uppercase_BADGE_BASIC_TABLE',
-      body: {
-        name: 'Debug API Card BADGE_BASIC_TABLE',
-        description: 'Created via API',
-        dataSetId: datasetId,
-        chartType: 'BADGE_BASIC_TABLE',
-      },
-    },
-    // Try D: Uppercase BADGE_TABLE
-    {
-      name: 'uppercase_BADGE_TABLE',
-      body: {
-        name: 'Debug API Card BADGE_TABLE',
-        description: 'Created via API',
-        dataSetId: datasetId,
-        chartType: 'BADGE_TABLE',
-      },
-    },
-    // Try E: doc_format_name but with different uppercase chartType values
-    {
-      name: 'uppercase_BAR',
-      body: {
-        name: 'Debug API Card BAR',
-        description: 'Created via API',
-        dataSetId: datasetId,
-        chartType: 'BAR',
-      },
-    },
-  ];
-
-  results.chartApiAttempts = [];
-  for (const attempt of attempts) {
-    try {
-      console.log(`[DEBUG] ${attempt.name}: POST ${chartUrl}`);
-      console.log(`[DEBUG] Body: ${JSON.stringify(attempt.body).slice(0, 300)}`);
-      const res = await axios.post(chartUrl, attempt.body, {
-        headers: oauthHeaders, timeout: 15000, validateStatus: () => true,
-      });
-      const entry = {
-        name: attempt.name,
-        status: res.status,
-        response: JSON.stringify(res.data)?.slice(0, 500),
-      };
-      results.chartApiAttempts.push(entry);
-      console.log(`[DEBUG] ${attempt.name}: HTTP ${res.status} → ${entry.response?.slice(0, 300)}`);
-
-      if (res.status >= 200 && res.status < 300) {
-        console.log(`[DEBUG] ✅ SUCCESS with "${attempt.name}"!`);
-        break;
-      }
-    } catch (e) {
-      results.chartApiAttempts.push({ name: attempt.name, error: e.message });
-    }
-  }
-
-  // ── Probe 3: Also try POST /v1/cards (not /chart) ─────────────────────────
-  try {
-    const body = {
-      name: 'Debug Card v1',
-      description: 'test',
-      dataSetId: datasetId,
-      chartType: 'table',
-    };
-    console.log('[DEBUG] Trying POST /v1/cards (not /chart)');
-    const res = await axios.post('https://api.domo.com/v1/cards', body, {
-      headers: oauthHeaders, timeout: 15000, validateStatus: () => true,
-    });
-    results.cardsEndpoint = {
-      status: res.status,
-      response: JSON.stringify(res.data)?.slice(0, 500),
-    };
-    console.log(`[DEBUG] POST /v1/cards: HTTP ${res.status} → ${JSON.stringify(res.data)?.slice(0, 300)}`);
-  } catch (e) {
-    results.cardsEndpoint = { error: e.message };
-  }
-
-  return results;
 }

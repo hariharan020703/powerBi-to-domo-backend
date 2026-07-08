@@ -24,6 +24,18 @@ const completedModelViews = new Set();
 // In-memory mapping of active migrations keyed by reportId
 const _migrationInFlight = new Map();
 
+// In-memory set of cancellation tokens for migrations in progress
+const cancellationTokens = new Set();
+
+function checkCancellation(reportId, results) {
+  if (cancellationTokens.has(reportId)) {
+    const err = new Error('Migration cancelled by user.');
+    err.status = 400;
+    err.migratedTables = results;
+    throw err;
+  }
+}
+
 /**
  * Utility helper to update status and notify SSE listeners.
  */
@@ -415,26 +427,26 @@ async function migrateMeasuresToBeastModes(measures, domoDatasetId, availableCol
     //   console.log(`[BEAST MODE] Bulk creation succeeded: ${readyForDomoMeasures.length} Beast Mode(s) created.`);
     // } catch (bulkErr) {
     //   console.warn(`[BEAST MODE] Bulk creation failed (${bulkErr.message}). Falling back to individual creation...`);
-      for (const cm of readyForDomoMeasures) {
-        const enriched = enrichedMeasures.find(m => m.name === cm.name);
-        try {
-          const singleResponse = await createBeastModeFunction(domain, token, ownerId, cm);
-          if (enriched) {
-            enriched.domoFunctionId = singleResponse?.id || singleResponse?.functionTemplateId || null;
-            enriched.status = 'created';
-            summary.created++;
-          }
-        } catch (singleErr) {
-          const status = singleErr.response?.status ?? 'N/A';
-          const errMsg = singleErr.response ? JSON.stringify(singleErr.response.data) : singleErr.message;
-          console.error(`[BEAST MODE] Individual creation failed for '${cm.name}': HTTP ${status} - ${errMsg}`);
-          if (enriched) {
-            enriched.status = 'creation_failed';
-            enriched.error = `Domo API error: HTTP ${status} - ${errMsg}`;
-            summary.failed++;
-          }
+    for (const cm of readyForDomoMeasures) {
+      const enriched = enrichedMeasures.find(m => m.name === cm.name);
+      try {
+        const singleResponse = await createBeastModeFunction(domain, token, ownerId, cm);
+        if (enriched) {
+          enriched.domoFunctionId = singleResponse?.id || singleResponse?.functionTemplateId || null;
+          enriched.status = 'created';
+          summary.created++;
+        }
+      } catch (singleErr) {
+        const status = singleErr.response?.status ?? 'N/A';
+        const errMsg = singleErr.response ? JSON.stringify(singleErr.response.data) : singleErr.message;
+        console.error(`[BEAST MODE] Individual creation failed for '${cm.name}': HTTP ${status} - ${errMsg}`);
+        if (enriched) {
+          enriched.status = 'creation_failed';
+          enriched.error = `Domo API error: HTTP ${status} - ${errMsg}`;
+          summary.failed++;
         }
       }
+    }
     // }
   } else if (readyForDomoMeasures.length > 0 && !ownerId) {
     for (const cm of readyForDomoMeasures) {
@@ -503,6 +515,7 @@ router.post('/start', async (req, res, next) => {
   const migrationPromise = (async () => {
 
     try {
+      checkCancellation(reportId, results);
 
       if (isDashboard) {
         // ─── DASHBOARD MIGRATION FLOW ──────────────────────────────────────────
@@ -546,6 +559,7 @@ router.post('/start', async (req, res, next) => {
 
         // Loop through unique datasets and migrate them
         for (let i = 0; i < datasetIds.length; i++) {
+          checkCancellation(reportId, results);
           const targetDatasetId = datasetIds[i];
           const ctx = uniqueDatasets.get(targetDatasetId);
           const baseProgress = 20 + Math.round((i / datasetIds.length) * 60);
@@ -677,6 +691,7 @@ router.post('/start', async (req, res, next) => {
                   domoDatasetId: targetDomoDatasetId,
                   status: 'dataset_created',
                   columns,
+                  rawColumns: columns,
                   rowCount: rawRows.length
                 });
               }
@@ -722,13 +737,13 @@ router.post('/start', async (req, res, next) => {
                         setTableState(tableName, { status: 'etl_created', magicEtl: magicEtlResult });
                         try {
                           // Trigger execution disabled per request
-                          // const { executionId } = await runMagicEtlDataflow(magicEtlResult.dataflowId);
-                          // const execResult = await pollEtlExecution(magicEtlResult.dataflowId, executionId);
-                          // if (!execResult.succeeded) {
-                          //   console.warn(`[MAGIC ETL] Report ETL execution failed for '${tableName}': ${execResult.error}`);
-                          //   magicEtlResult.executionStatus = execResult.status;
-                          //   magicEtlResult.outputDatasetId = null;
-                          // } else {
+                          const { executionId } = await runMagicEtlDataflow(magicEtlResult.dataflowId);
+                          const execResult = await pollEtlExecution(magicEtlResult.dataflowId, executionId);
+                          if (!execResult.succeeded) {
+                            console.warn(`[MAGIC ETL] Report ETL execution failed for '${tableName}': ${execResult.error}`);
+                            magicEtlResult.executionStatus = execResult.status;
+                            magicEtlResult.outputDatasetId = null;
+                          } else {
                             magicEtlResult.executionStatus = 'SKIPPED';
                             const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
                             const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
@@ -746,7 +761,7 @@ router.post('/start', async (req, res, next) => {
                               null;
                             magicEtlResult.outputDatasetId = outputDatasetId;
                             console.log(`[MAGIC ETL] Fetched dataflow details. Output Dataset ID: ${outputDatasetId}`);
-                          // }
+                          }
                         } catch (runErr) {
                           console.error(`[MAGIC ETL RUN ERROR] Non-fatal (report) for '${tableName}': ${runErr.message}`);
                           magicEtlResult.executionStatus = 'RUN_ERROR';
@@ -765,22 +780,8 @@ router.post('/start', async (req, res, next) => {
                   }
                 }
 
-                if (magicEtlResult && magicEtlResult.outputDatasetId) {
-                  finalDomoDatasetId = magicEtlResult.outputDatasetId;
-                  try {
-                    const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
-                    const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-                    console.log(`[MIGRATION] Fetching transformed columns for card layout (Dataset ID: ${finalDomoDatasetId})...`);
-                    const schemaCols = await fetchDomoDatasetSchema(domain, token, finalDomoDatasetId);
-                    if (schemaCols && schemaCols.length > 0) {
-                      cardColumns = schemaCols.map(c => ({ name: c.name, type: c.type }));
-                    }
-                  } catch (cardSchemaErr) {
-                    console.warn(`[MIGRATION WARNING] Failed to fetch transformed schema columns:`, cardSchemaErr.message);
-                  }
-                } else {
-                  finalDomoDatasetId = targetDomoDatasetId;
-                }
+                // Card & Beast Mode calculations created on the raw dataset instead of ETL
+                finalDomoDatasetId = targetDomoDatasetId;
 
                 // Update status to success
                 setTableState(tableName, {
@@ -864,7 +865,8 @@ router.post('/start', async (req, res, next) => {
               domoDatasetId: finalDomoDatasetId,
               columns: cardColumns || [],
               beastModeIds: dashBeastModeIds,
-              ownerId: dashCardOwnerId
+              ownerId: dashCardOwnerId,
+              chartType: 'badge_vert_bar',
             });
 
             createdCardIds.push(dashCardResult.cardId);
@@ -898,7 +900,7 @@ router.post('/start', async (req, res, next) => {
             const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
             const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
             let dashPageOwnerId = null;
-            try { dashPageOwnerId = await fetchCurrentUserId(domain, token); } catch(e) {}
+            try { dashPageOwnerId = await fetchCurrentUserId(domain, token); } catch (e) { }
 
             const dashPage = await createDomoPage(domain, token, {
               pageName: `${reportName} Dashboard`,
@@ -917,8 +919,8 @@ router.post('/start', async (req, res, next) => {
           success: true,
           progress: 100,
           reportName,
-          domoDashboardId: dashPageId,                         // real page ID
-          domoCardUrl: dashPageUrl || results[0]?.domoCardUrl, // real page URL
+          domoDashboardId: dashPageId,
+          domoCardUrl: dashPageUrl || results[0]?.domoCardUrl,
           migratedTables: results,
           mExpressionFetchFailed: migrations.get(reportId)?.mExpressionFetchFailed || false,
           mExpressionFetchError: migrations.get(reportId)?.mExpressionFetchError || null,
@@ -1014,6 +1016,7 @@ router.post('/start', async (req, res, next) => {
         console.log("[MEASURES FOUND]", measures.length);
 
         for (let i = 0; i < tableNames.length; i++) {
+          checkCancellation(reportId, results);
           const tableName = tableNames[i];
 
           // Check if table was already successfully uploaded/migrated in a previous run for this report
@@ -1110,7 +1113,7 @@ router.post('/start', async (req, res, next) => {
               console.log(`[MIGRATION] Dataset created in Domo. ID: ${domoDatasetId}`);
 
               // State Order 1: Dataset created
-              setTableState(tableName, { domoDatasetId, status: 'dataset_created', columns, rowCount });
+              setTableState(tableName, { domoDatasetId, status: 'dataset_created', columns, rawColumns: columns, rowCount });
             }
 
             if (!firstTableColumns) {
@@ -1138,11 +1141,15 @@ router.post('/start', async (req, res, next) => {
                     migratedTables: results
                   });
 
-                  const tableExpr = allMExpressions.find(e => e.tableName === tableName);
+                  const tableExpr = allMExpressions.find(e => e.tableName === tableName || e.tableName.toLowerCase() === tableName.toLowerCase());
 
                   if (tableExpr && tableExpr.mExpression) {
                     console.log(`[MAGIC ETL] Found M expression for '${tableName}' (${tableExpr.mExpression.length} chars). Parsing...`);
                     const steps = parsePowerQuerySteps(tableExpr.mExpression);
+
+                    if (steps.length === 0) {
+                      console.warn(`[MAGIC ETL] ⚠ parsePowerQuerySteps returned 0 steps for '${tableName}'. M expression first 200 chars: ${tableExpr.mExpression.substring(0, 200)}`);
+                    }
 
                     // Store ETL step metadata for downstream reporting
                     const manualCount = steps.filter(s => s.actionType === 'MANUAL_BUILD').length;
@@ -1152,26 +1159,30 @@ router.post('/start', async (req, res, next) => {
                       parsedSteps: steps.map(s => ({ stepName: s.stepName, actionType: s.actionType, description: s.description }))
                     });
 
-                    console.log(`[MAGIC ETL] Parsed ${steps.length} step(s) for '${tableName}'. Submitting to Domo...`);
+                    console.log(`[MAGIC ETL] Parsed ${steps.length} step(s) for '${tableName}' (${manualCount} manual). Submitting to Domo...`);
                     const dataflowDef = buildDataflowDefinition(reportName, tableName, domoDatasetId, steps);
                     magicEtlResult = await createMagicEtlDataflow(dataflowDef);
-                    console.log(`[MAGIC ETL] createMagicEtlDataflow result for '${tableName}':`, JSON.stringify({
-                      dataflowId: magicEtlResult?.dataflowId,
-                      outputDatasetId: magicEtlResult?.outputDatasetId,
-                      skipped: magicEtlResult?.skipped,
-                      error: magicEtlResult?.error
-                    }));
+                    if (magicEtlResult === null) {
+                      console.warn(`[MAGIC ETL] createMagicEtlDataflow returned null for '${tableName}' — dataflow was skipped (likely 0 parseable steps).`);
+                    } else {
+                      console.log(`[MAGIC ETL] createMagicEtlDataflow result for '${tableName}':`, JSON.stringify({
+                        dataflowId: magicEtlResult?.dataflowId,
+                        outputDatasetId: magicEtlResult?.outputDatasetId,
+                        skipped: magicEtlResult?.skipped,
+                        error: magicEtlResult?.error
+                      }));
+                    }
                     if (magicEtlResult && magicEtlResult.dataflowId) {
                       setTableState(tableName, { status: 'etl_created', magicEtl: magicEtlResult });
                       try {
                         // Trigger execution disabled per request
-                        // const { executionId } = await runMagicEtlDataflow(magicEtlResult.dataflowId);
-                        // const execResult = await pollEtlExecution(magicEtlResult.dataflowId, executionId);
-                        // if (!execResult.succeeded) {
-                        //   console.warn(`[MAGIC ETL] Report ETL execution failed for '${tableName}': ${execResult.error}`);
-                        //   magicEtlResult.executionStatus = execResult.status;
-                        //   magicEtlResult.outputDatasetId = null;
-                        // } else {
+                        const { executionId } = await runMagicEtlDataflow(magicEtlResult.dataflowId);
+                        const execResult = await pollEtlExecution(magicEtlResult.dataflowId, executionId);
+                        if (!execResult.succeeded) {
+                          console.warn(`[MAGIC ETL] Report ETL execution failed for '${tableName}': ${execResult.error}`);
+                          magicEtlResult.executionStatus = execResult.status;
+                          magicEtlResult.outputDatasetId = null;
+                        } else {
                           magicEtlResult.executionStatus = 'SKIPPED';
                           const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
                           const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
@@ -1189,7 +1200,7 @@ router.post('/start', async (req, res, next) => {
                             null;
                           magicEtlResult.outputDatasetId = outputDatasetId;
                           console.log(`[MAGIC ETL] Fetched dataflow details. Output Dataset ID: ${outputDatasetId}`);
-                        // }
+                        }
                       } catch (runErr) {
                         console.error(`[MAGIC ETL RUN ERROR] Non-fatal (report) for '${tableName}': ${runErr.message}`);
                         magicEtlResult.executionStatus = 'RUN_ERROR';
@@ -1197,6 +1208,7 @@ router.post('/start', async (req, res, next) => {
                       }
                     }
                   } else {
+                    console.warn(`[MAGIC ETL] ⚠ No M expression found for table '${tableName}'. Available expressions: [${allMExpressions.map(e => e.tableName).join(', ')}]`);
                     magicEtlResult = { skipped: true };
                   }
                 } catch (etlErr) {
@@ -1346,42 +1358,22 @@ router.post('/start', async (req, res, next) => {
         // 2. Per-table Magic ETL output
         // 3. Raw upload dataset (fallback)
 
-        if (domoDataflowResult?.outputDatasetId && domoDataflowResult.outputDatasetId !== 'failed') {
-          targetDomoDatasetId = domoDataflowResult.outputDatasetId;
-          console.log(`[MIGRATION] Using Model View output dataset as canonical target: ${targetDomoDatasetId}`);
-          try {
-            const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
-            const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-            const schemaCols = await fetchDomoDatasetSchema(domain, token, targetDomoDatasetId);
-            targetColumns = schemaCols.map(c => c.name);
-          } catch (schemaErr) {
-            console.warn(`[MIGRATION WARNING] Failed to fetch Model View schema:`, schemaErr.message);
-            const allCols = new Set();
-            for (const t of results) {
-              if (t.status === 'success' && t.columns) {
-                t.columns.forEach(c => allCols.add(c.name));
-              }
-            }
-            targetColumns = Array.from(allCols);
-          }
-        } else {
-          const successfulTables = results.filter(t => t.status === 'success');
-          let canonicalTable = canonicalTableName
-            ? successfulTables.find(t => t.tableName === canonicalTableName)
-            : null;
-          if (!canonicalTable) canonicalTable = successfulTables[0];
+        const successfulTables = results.filter(t => t.status === 'success');
+        let canonicalTable = canonicalTableName
+          ? successfulTables.find(t => t.tableName === canonicalTableName)
+          : null;
+        if (!canonicalTable) canonicalTable = successfulTables[0];
 
-          if (canonicalTable) {
-            targetDomoDatasetId = canonicalTable.magicEtl?.outputDatasetId || canonicalTable.domoDatasetId;
-            console.log(`[MIGRATION] Using table '${canonicalTable.tableName}' as canonical target: ${targetDomoDatasetId}`);
+        if (canonicalTable) {
+          targetDomoDatasetId = canonicalTable.domoDatasetId; // Always raw dataset ID!
+          console.log(`[MIGRATION] Using raw dataset of table '${canonicalTable.tableName}' as canonical target for Beast Modes: ${targetDomoDatasetId}`);
 
-            const allColumnsSet = new Set();
-            for (const t of results.filter(r => r.status === 'success')) {
-              (t.columns || []).forEach(c => allColumnsSet.add(c.name));
-            }
-            targetColumns = Array.from(allColumnsSet);
-            console.log(`[MIGRATION] Total columns across all tables for Beast Mode: ${targetColumns.length}`);
+          const allColumnsSet = new Set();
+          for (const t of results.filter(r => r.status === 'success')) {
+            (t.rawColumns || t.columns || []).forEach(c => allColumnsSet.add(c.name));
           }
+          targetColumns = Array.from(allColumnsSet);
+          console.log(`[MIGRATION] Total columns across all tables for Beast Mode: ${targetColumns.length}`);
         }
 
         if (datasetMeasures.length > 0 && targetDomoDatasetId) {
@@ -1437,7 +1429,6 @@ router.post('/start', async (req, res, next) => {
         // Step 5: Create real Domo cards and dashboard page
         updateStatus(reportId, { status: 'Creating Domo cards and dashboard', progress: 85, migratedTables: results });
 
-        const successfulTables = results.filter(t => t.status === 'success');
         if (successfulTables.length === 0) {
           throw new Error("No tables migrated successfully.");
         }
@@ -1473,38 +1464,343 @@ router.post('/start', async (req, res, next) => {
             .filter(m => m.domoFunctionId && m.status === 'created')
             .map(m => m.domoFunctionId);
 
-          // Create one card per successful table
+          // ── Try layout-driven card creation (same pipeline as /migrate-report-layout) ──
+          let cardsToCreate = [];
+          try {
+            updateStatus(reportId, {
+              ...migrations.get(reportId),
+              status: 'Fetching report layout for card creation',
+              progress: 85,
+              migratedTables: results
+            });
+
+            const {
+              exportReportToPbix,
+              extractReportLayout,
+              parseReportLayout,
+              mapPagesToDomo,
+            } = await import('../services/powerbiLayoutService.js');
+
+            // Build tableName -> final Domo dataset ID map
+            const domoDatasetIdMap = {};
+            const datasetColumnsMap = {};
+            const columnCaseMap = {};
+            const datasetColumnTypesMap = {};
+
+            const modelOutputDatasetId = domoDataflowResult?.outputDatasetId;
+            let fetchedModelColumns = [];
+
+            if (modelOutputDatasetId && modelOutputDatasetId !== 'failed' && modelOutputDatasetId !== 'undefined') {
+              try {
+                console.log(`[MIGRATION LAYOUT] Fetching merged Model View schema for dataset: ${modelOutputDatasetId}`);
+                fetchedModelColumns = await fetchDomoDatasetSchema(domain, token, modelOutputDatasetId);
+                console.log(`[MIGRATION LAYOUT] Successfully fetched ${fetchedModelColumns?.length || 0} columns for merged dataset.`);
+              } catch (err) {
+                console.warn(`[MIGRATION LAYOUT] Failed to fetch schema for merged dataset ${modelOutputDatasetId}:`, err.message);
+              }
+            }
+
+            if (fetchedModelColumns && fetchedModelColumns.length > 0) {
+              const colNames = fetchedModelColumns.map(c => c.name || c.columnName);
+              datasetColumnsMap[modelOutputDatasetId] = colNames;
+              for (const t of successfulTables) {
+                domoDatasetIdMap[t.tableName] = modelOutputDatasetId;
+                datasetColumnsMap[t.tableName] = colNames;
+              }
+
+              columnCaseMap[modelOutputDatasetId] = {};
+              colNames.forEach(c => {
+                columnCaseMap[modelOutputDatasetId][c.toLowerCase()] = c;
+              });
+
+              for (const c of fetchedModelColumns) {
+                const cName = c.name || c.columnName;
+                if (typeof cName === 'string') {
+                  const type = (c.type || 'STRING').toUpperCase();
+                  datasetColumnTypesMap[`${modelOutputDatasetId}.${cName.toLowerCase()}`] = type;
+                  for (const t of successfulTables) {
+                    datasetColumnTypesMap[`${t.tableName}.${cName.toLowerCase()}`] = type;
+                  }
+                }
+              }
+            } else {
+              // Fallback to per-table mapping if no merged Model View dataset was created
+              for (const t of successfulTables) {
+                const finalId = t.domoDatasetId;
+                if (!finalId) continue;
+                domoDatasetIdMap[t.tableName] = finalId;
+                const colNames = (t.rawColumns || t.columns || []).map(c => c.name);
+                datasetColumnsMap[t.tableName] = colNames;
+                datasetColumnsMap[finalId] = colNames;
+                columnCaseMap[finalId] = columnCaseMap[finalId] || {};
+                colNames.forEach(c => { columnCaseMap[finalId][c.toLowerCase()] = c; });
+
+                const rawCols = t.rawColumns || t.columns || [];
+                for (const c of rawCols) {
+                  if (c && c.name) {
+                    const type = (c.type || 'STRING').toUpperCase();
+                    datasetColumnTypesMap[`${finalId}.${c.name.toLowerCase()}`] = type;
+                    datasetColumnTypesMap[`${t.tableName}.${c.name.toLowerCase()}`] = type;
+                  }
+                }
+              }
+            }
+
+            // Build measureName -> beastModeId map from what's already migrated
+            const domoMeasureIdMap = {};
+            for (const m of migratedMeasures) {
+              if (m.domoFunctionId && m.status === 'created') {
+                domoMeasureIdMap[m.name] = m.domoFunctionId;
+              }
+            }
+
+            const pbixBuffer = await exportReportToPbix(workspaceId, reportId);
+            const layout = extractReportLayout(pbixBuffer);
+            const parsedPages = parseReportLayout(layout.data);
+            const mapped = mapPagesToDomo(parsedPages, domoDatasetIdMap, domoMeasureIdMap, datasetColumnsMap, columnCaseMap, datasetColumnTypesMap);
+            cardsToCreate = mapped.cardsToCreate;
+
+            updateStatus(reportId, {
+              ...migrations.get(reportId),
+              migrationReport: mapped.migrationReport,
+              migratedTables: results
+            });
+
+            console.log(`[MIGRATION] Layout-based card plan: ${cardsToCreate.length} cards across ${parsedPages.length} pages.`);
+          } catch (layoutErr) {
+            console.error('[MIGRATION] Layout export/parse failed, falling back to per-table cards:', layoutErr.message);
+            cardsToCreate = [];
+          }
+
           const createdCards = [];
-          for (const table of successfulTables) {
-            const tableDatasetId = (table.magicEtl?.outputDatasetId) || table.domoDatasetId;
-            if (!tableDatasetId) continue;
 
-            try {
-              updateStatus(reportId, {
-                ...migrations.get(reportId),
-                status: `Creating card for table: ${table.tableName}`,
-                progress: 86,
-                migratedTables: results
-              });
+          if (cardsToCreate.length > 0) {
+            // Group cards by page
+            const cardsByPage = {};
+            for (const card of cardsToCreate) {
+              const key = `${card.pageOrder}__${card.page}`;
+              if (!cardsByPage[key]) {
+                cardsByPage[key] = {
+                  pageName: card.page,
+                  pageOrder: card.pageOrder,
+                  cards: [],
+                };
+              }
+              cardsByPage[key].cards.push(card);
+            }
 
-              const cardResult = await createDomoCard(domain, token, {
-                cardName: `${reportName} - ${table.tableName}`,
-                domoDatasetId: tableDatasetId,
-                columns: table.columns || [],
-                beastModeIds,
-                ownerId: cardOwnerId
-              });
+            // For each page, create Domo page then create and attach cards
+            const sortedPageKeys = Object.keys(cardsByPage).sort(
+              (a, b) => cardsByPage[a].pageOrder - cardsByPage[b].pageOrder
+            );
 
-              createdCards.push({
-                tableName: table.tableName,
-                cardId: cardResult.cardId,
-                cardUrl: cardResult.cardUrl
-              });
+            let firstPageId = null;
+            let firstPageUrl = null;
 
-              console.log(`[CARD] Created card for '${table.tableName}': ${cardResult.cardUrl}`);
-            } catch (cardErr) {
-              console.error(`[CARD ERROR] Failed to create card for '${table.tableName}':`, cardErr.message);
-              cardCreationWarning = `Some cards failed to create: ${cardErr.message}`;
+            for (const pageKey of sortedPageKeys) {
+              const { pageName, cards } = cardsByPage[pageKey];
+              let pageId = null;
+
+              // Create Domo page
+              try {
+                updateStatus(reportId, {
+                  ...migrations.get(reportId),
+                  status: `Creating page: ${pageName}`,
+                  progress: 86,
+                  migratedTables: results
+                });
+
+                const pageRes = await createDomoPage(domain, token, {
+                  pageName: `${reportName || reportId} - ${pageName}`,
+                  ownerId: cardOwnerId,
+                });
+                pageId = pageRes.pageId;
+                if (!firstPageId) {
+                  firstPageId = pageRes.pageId;
+                  firstPageUrl = pageRes.pageUrl;
+                }
+                console.log(`[MIGRATION] ✅ Created page "${pageName}": ${pageRes.pageUrl}`);
+              } catch (pageErr) {
+                console.error(`[MIGRATION] ❌ Failed to create page "${pageName}":`, pageErr.message);
+                cardCreationWarning = `Some pages failed to create: ${pageErr.message}`;
+                continue;
+              }
+
+              // Create cards for this page
+              const pageCardIds = [];
+              for (const card of cards) {
+                const datasetId = card.domoDatasetId ||
+                  (domoDatasetIdMap ? Object.values(domoDatasetIdMap)[0] : null);
+
+                if (!datasetId) {
+                  console.warn(`[CARD] Skipping "${card.cardName}" — no dataset ID available.`);
+                  continue;
+                }
+
+                const cardName = card.cardName ||
+                  `${pageName} - ${card.powerBiVisualType} (${card.powerBiVisualId})`;
+
+                // Validate columns — use fallback if none valid
+                let finalColumns = (card.columns || []).filter(c => c && c.column && c.column.trim() !== '');
+
+                if (finalColumns.length === 0) {
+                  const isSingleValue = card.domoChartType === 'badge_singlevalue' || card.domoChartType === 'badge_single_value';
+                  if (isSingleValue) {
+                    console.warn(`[MIGRATION] Skipping KPI card "${cardName}" — visual has no accurate mapped columns/measures`);
+                    continue;
+                  }
+
+                  const availableCols = datasetColumnsMap[datasetId] ||
+                    datasetColumnsMap[card.domoDatasetId] || [];
+                  const firstCol = availableCols[0];
+                  if (firstCol) {
+                    console.warn(`[MIGRATION] "${cardName}" has no columns — using COUNT(${firstCol}) as fallback`);
+                    finalColumns = [
+                      { column: firstCol, mapping: 'ITEM' },
+                      { column: firstCol, mapping: 'VALUE', aggregation: 'COUNT' },
+                    ];
+                  } else {
+                    console.warn(`[MIGRATION] Skipping "${cardName}" — no columns and no fallback available`);
+                    continue;
+                  }
+                }
+
+                try {
+                  updateStatus(reportId, {
+                    ...migrations.get(reportId),
+                    status: `Creating card: ${cardName}`,
+                    progress: 88,
+                    migratedTables: results
+                  });
+
+                  console.log(`[MIGRATION] Creating card "${cardName}" | chartType: ${card.domoChartType} | dataset: ${datasetId}`);
+
+                  const cardRes = await createDomoCard(domain, token, {
+                    cardName,
+                    domoDatasetId: datasetId,
+                    columns: finalColumns,
+                    beastModeIds: card.beastModeIds && card.beastModeIds.length > 0 ? card.beastModeIds : beastModeIds,
+                    chartType: card.domoChartType,
+                    ownerId: cardOwnerId,
+                  });
+
+                  if (cardRes.cardId) {
+                    pageCardIds.push(cardRes.cardId);
+                    createdCards.push({
+                      tableName: card.page,
+                      cardId: cardRes.cardId,
+                      cardUrl: cardRes.cardUrl,
+                    });
+                    console.log(`[MIGRATION] ✅ Created card "${cardName}" (${card.powerBiVisualType} → ${card.domoChartType}): ${cardRes.cardUrl}`);
+                  } else {
+                    console.error(`[MIGRATION ERROR] "${cardName}": ${cardRes.error}`);
+                    cardCreationWarning = `Some cards failed to create: ${cardRes.error}`;
+                  }
+                } catch (cardErr) {
+                  console.error(`[MIGRATION ERROR] Failed to create card "${cardName}":`, cardErr.message);
+                  cardCreationWarning = `Some cards failed to create: ${cardErr.message}`;
+                }
+              }
+
+              // Add cards to page
+              if (pageCardIds.length > 0 && pageId) {
+                try {
+                  await addCardsToPage(domain, token, pageId, pageCardIds);
+                  console.log(`[MIGRATION] ✅ Added ${pageCardIds.length} card(s) to page "${pageName}"`);
+                } catch (addErr) {
+                  console.error(`[MIGRATION ERROR] Failed to add cards to page "${pageName}":`, addErr.message);
+                }
+              }
+            }
+
+            domoDashboardPageId = firstPageId;
+            domoDashboardPageUrl = firstPageUrl;
+          } else {
+            // ── Fallback: one generic card per successful table (old behavior) ──
+            for (const table of successfulTables) {
+              const tableDatasetId = table.domoDatasetId; // Raw dataset always!
+              if (!tableDatasetId) continue;
+
+              try {
+                updateStatus(reportId, {
+                  ...migrations.get(reportId),
+                  status: `Creating card for table: ${table.tableName}`,
+                  progress: 86,
+                  migratedTables: results
+                });
+
+                const cardResult = await createDomoCard(domain, token, {
+                  cardName: `${reportName} - ${table.tableName}`,
+                  domoDatasetId: tableDatasetId,
+                  columns: table.rawColumns || table.columns || [],
+                  beastModeIds,
+                  ownerId: cardOwnerId
+                });
+
+                if (cardResult.cardId) {
+                  createdCards.push({
+                    tableName: table.tableName,
+                    cardId: cardResult.cardId,
+                    cardUrl: cardResult.cardUrl
+                  });
+                  console.log(`[CARD] Created card for '${table.tableName}': ${cardResult.cardUrl}`);
+                }
+              } catch (cardErr) {
+                console.error(`[CARD ERROR] Failed to create card for '${table.tableName}':`, cardErr.message);
+                cardCreationWarning = `Some cards failed to create: ${cardErr.message}`;
+              }
+            }
+
+            // Create dashboard pages and add cards to their respective pages
+            if (createdCards.length > 0) {
+              try {
+                updateStatus(reportId, {
+                  ...migrations.get(reportId),
+                  status: 'Creating Domo dashboard pages',
+                  progress: 90,
+                  migratedTables: results
+                });
+
+                // Group created cards by page/table name
+                const cardsByPage = {};
+                for (const card of createdCards) {
+                  const pageName = card.tableName || 'Overview';
+                  if (!cardsByPage[pageName]) {
+                    cardsByPage[pageName] = [];
+                  }
+                  cardsByPage[pageName].push(card.cardId);
+                }
+
+                let firstPageId = null;
+                let firstPageUrl = null;
+
+                for (const [pageName, cardIds] of Object.entries(cardsByPage)) {
+                  if (cardIds.length === 0) continue;
+
+                  console.log(`[CARD] Creating page for tab/table: "${pageName}" with ${cardIds.length} cards`);
+                  const pageResult = await createDomoPage(domain, token, {
+                    pageName: `${reportName} - ${pageName}`,
+                    ownerId: cardOwnerId
+                  });
+
+                  if (!firstPageId) {
+                    firstPageId = pageResult.pageId;
+                    firstPageUrl = pageResult.pageUrl;
+                  }
+
+                  await addCardsToPage(domain, token, pageResult.pageId, cardIds);
+                  console.log(`[CARD] Domo page "${pageName}" created: ${pageResult.pageUrl}`);
+                }
+
+                domoDashboardPageId = firstPageId;
+                domoDashboardPageUrl = firstPageUrl;
+
+              } catch (pageErr) {
+                console.error('[CARD ERROR] Failed to create dashboard page(s):', pageErr.message);
+                cardCreationWarning = cardCreationWarning
+                  ? cardCreationWarning + '; Dashboard page creation failed'
+                  : 'Dashboard page creation failed: ' + pageErr.message;
+              }
             }
           }
 
@@ -1514,36 +1810,7 @@ router.post('/start', async (req, res, next) => {
             domoCardUrl = createdCards[0].cardUrl;
           }
 
-          // Create dashboard page and add all cards to it
-          if (createdCards.length > 0) {
-            try {
-              updateStatus(reportId, {
-                ...migrations.get(reportId),
-                status: 'Creating Domo dashboard page',
-                progress: 90,
-                migratedTables: results
-              });
-
-              const pageResult = await createDomoPage(domain, token, {
-                pageName: `${reportName} Dashboard`,
-                ownerId: cardOwnerId
-              });
-
-              domoDashboardPageId = pageResult.pageId;
-              domoDashboardPageUrl = pageResult.pageUrl;
-
-              await addCardsToPage(domain, token, domoDashboardPageId, createdCards.map(c => c.cardId));
-              console.log(`[CARD] Dashboard page created: ${domoDashboardPageUrl}`);
-
-            } catch (pageErr) {
-              console.error('[CARD ERROR] Failed to create dashboard page:', pageErr.message);
-              cardCreationWarning = cardCreationWarning
-                ? cardCreationWarning + '; Dashboard page creation failed'
-                : 'Dashboard page creation failed: ' + pageErr.message;
-            }
-          }
-
-          // Store card results in table state
+          // Store card results in table state (group by originating table/page)
           for (const card of createdCards) {
             setTableState(card.tableName, { domoCardId: card.cardId, domoCardUrl: card.cardUrl });
           }
@@ -1559,8 +1826,8 @@ router.post('/start', async (req, res, next) => {
           progress: 100,
           reportName,
           domoDatasetId: finalTargetDomoDatasetId,
-          domoCardId,          // now real card ID
-          domoCardUrl,         // now real card URL
+          domoCardId,
+          domoCardUrl,
           domoDashboardId: domoDashboardPageId,
           domoDashboardUrl: domoDashboardPageUrl,
           migratedTables: results,
@@ -1613,13 +1880,74 @@ router.post('/start', async (req, res, next) => {
     });
   } finally {
     _migrationInFlight.delete(reportId);
+    cancellationTokens.delete(reportId);
   }
 });
 
-/**
- * GET /api/migration/status/:reportId
- * Exposes SSE channel streaming status updates to the client.
- */
+router.get('/workspaces/:workspaceId/reports/:reportId/visuals', async (req, res) => {
+  const { workspaceId, reportId } = req.params;
+  try {
+    const { exportReportToPbix, extractReportLayout, parseReportLayout } = await import('../services/powerbiLayoutService.js');
+    console.log(`[ROUTE API] Fetching layout for workspace ${workspaceId}, report ${reportId}`);
+    const pbixBuffer = await exportReportToPbix(workspaceId, reportId);
+    const layout = extractReportLayout(pbixBuffer);
+    const pages = parseReportLayout(layout.data);
+
+    // Extract all visuals across all pages
+    const visualsList = [];
+    for (const page of pages) {
+      const pageName = page.displayName || page.name || 'Page';
+      if (Array.isArray(page.visuals)) {
+        for (const v of page.visuals) {
+          // Normalize names and chart types for display
+          let chartType = v.visualType || 'KPI Card';
+          // Clean up chartType name e.g. "barChart" -> "Bar Chart"
+          if (chartType && chartType !== 'unknown') {
+            chartType = chartType
+              .replace(/([A-Z])/g, ' $1')
+              .replace(/^./, str => str.toUpperCase())
+              .trim();
+          }
+
+          const cleanFieldName = (name) => {
+            if (!name) return '';
+            let s = name.split('.').pop() || name;
+            return s.replace(/[\[\]']/g, '').replace(/_/g, ' ').trim();
+          };
+
+          let title = v.title;
+          if (!title || title === 'Unnamed Visual Card') {
+            const values = (v.fields?.values || []).map(cleanFieldName).filter(Boolean);
+            const categories = (v.fields?.category || []).map(cleanFieldName).filter(Boolean);
+            if (values.length > 0 && categories.length > 0) {
+              title = `${values.join(' & ')} by ${categories.join(' & ')}`;
+            } else if (values.length > 0) {
+              title = `Total ${values.join(' & ')}`;
+            } else if (categories.length > 0) {
+              title = `${categories.join(' & ')} Breakdown`;
+            } else {
+              title = `${chartType} Visual`;
+            }
+          }
+
+          visualsList.push({
+            id: String(v.id || ''),
+            title: title,
+            type: chartType,
+            page: pageName,
+            status: 'Ready'
+          });
+        }
+      }
+    }
+
+    res.json({ success: true, visuals: visualsList });
+  } catch (err) {
+    console.error(`[ROUTE API ERROR] Failed to extract visuals for report ${reportId}:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 router.get('/status/:reportId', (req, res) => {
   const { reportId } = req.params;
 
@@ -1627,170 +1955,131 @@ router.get('/status/:reportId', (req, res) => {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no'
   });
 
-  // Push immediate current state if exists
-  const current = migrations.get(reportId);
-  if (current) {
-    res.write(`data: ${JSON.stringify(current)}\n\n`);
+  // Send current status immediately if available
+  const currentState = migrations.get(reportId);
+  if (currentState) {
+    res.write(`data: ${JSON.stringify(currentState)}\n\n`);
   }
 
-  const statusListener = (update) => {
-    res.write(`data: ${JSON.stringify(update)}\n\n`);
-    if (update.status === 'complete' || update.status === 'error') {
-      res.end();
-    }
+  const listener = (updatedState) => {
+    res.write(`data: ${JSON.stringify(updatedState)}\n\n`);
   };
 
-  migrationEmitter.on(reportId, statusListener);
+  migrationEmitter.on(reportId, listener);
 
   req.on('close', () => {
-    migrationEmitter.off(reportId, statusListener);
+    migrationEmitter.off(reportId, listener);
   });
 });
 
-/**
- * GET /api/migration/test-card-creation
- * Tests the full card creation flow: cookie login → card creation → result
- */
-router.get('/test-card-creation', async (req, res) => {
-  const results = {
-    step1_cookieLogin: { status: 'pending', detail: null },
-    step2_cardCreation: { status: 'pending', detail: null },
-    step3_pageCreation: { status: 'pending', detail: null },
-  };
-
-  const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
-  const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-
-  // ── Step 1: Test cookie login ──────────────────────────────────────────────
-  try {
-    const { getAutomatedDomoCookie } = await import('../services/domoCookieService.js');
-    const cookie = await getAutomatedDomoCookie();
-
-    if (cookie) {
-      results.step1_cookieLogin = {
-        status: 'success',
-        detail: `Cookie obtained. Length: ${cookie.length}. Starts with: ${cookie.slice(0, 40)}...`,
-      };
-    } else {
-      results.step1_cookieLogin = {
-        status: 'failed',
-        detail: 'getAutomatedDomoCookie() returned null. Check DOMO_LOGIN_EMAIL, DOMO_LOGIN_PASSWORD, DOMO_CLIENT_DOMAIN in .env',
-      };
-      return res.status(500).json(results);
-    }
-  } catch (err) {
-    results.step1_cookieLogin = { status: 'error', detail: err.message };
-    return res.status(500).json(results);
+router.post('/stop', (req, res) => {
+  const { reportId } = req.body;
+  if (!reportId) {
+    return res.status(400).json({ success: false, error: 'reportId is required.' });
   }
+  console.log(`[MIGRATION] Received stop request for report ${reportId}`);
+  cancellationTokens.add(reportId);
 
-  // ── Step 2: Test card creation using first available dataset ───────────────
+  // Also clean up from in-flight
+  _migrationInFlight.delete(reportId);
+
+  // Update status immediately so UI updates
+  updateStatus(reportId, { status: 'error', progress: 0, message: 'Migration cancelled by user.' });
+
+  res.json({ success: true, message: 'Cancellation signal sent.' });
+});
+
+router.get('/inspect-report-visuals', async (req, res) => {
   try {
-    const { createDomoCard } = await import('../services/domoCardService.js');
+    const { exportReportToPbix, extractReportLayout, parseReportLayout } =
+      await import('../services/powerbiLayoutService.js');
 
-    // Use the known dataset ID from your migration logs
-    const testDatasetId = '1fa07c90-0cfe-4707-9964-6756799aef84';
-    const testColumns = [
-      { name: 'Unique_Key', type: 'STRING' },
-      { name: 'Order_DateTime', type: 'DATETIME' },
-      { name: 'Ordered_By', type: 'STRING' },
-    ];
+    const { workspaceId, reportId } = req.query;
 
-    const cardResult = await createDomoCard(domain, token, {
-      cardName: `Test Card - ${new Date().toISOString()}`,
-      domoDatasetId: testDatasetId,
-      columns: testColumns,
-      beastModeIds: [],
-      ownerId: null,
-    });
-
-    if (cardResult.cardId) {
-      results.step2_cardCreation = {
-        status: 'success',
-        detail: `Card created! ID: ${cardResult.cardId} | URL: ${cardResult.cardUrl}`,
-        cardId: cardResult.cardId,
-        cardUrl: cardResult.cardUrl,
-      };
-    } else {
-      results.step2_cardCreation = {
-        status: 'failed',
-        detail: cardResult.error || 'Card creation returned null ID',
-      };
-      return res.status(500).json(results);
+    if (!workspaceId || !reportId) {
+      return res.status(400).json({ error: 'workspaceId and reportId are required' });
     }
-  } catch (err) {
-    results.step2_cardCreation = { status: 'error', detail: err.message };
-    return res.status(500).json(results);
-  }
 
-  // ── Step 3: Test page creation ─────────────────────────────────────────────
-  try {
-    const { createDomoPage, addCardsToPage } = await import('../services/domoCardService.js');
+    const pbixBuffer = await exportReportToPbix(workspaceId, reportId);
+    const layout = extractReportLayout(pbixBuffer);
+    const pages = parseReportLayout(layout.data);
 
-    const pageResult = await createDomoPage(domain, token, {
-      pageName: `Test Page - ${new Date().toISOString()}`,
-      ownerId: null,
-    });
+    // Build detailed inspection result
+    const inspection = pages.map(page => ({
+      pageName: page.name,
+      pageOrder: page.order,
+      visualCount: page.visuals.length,
+      visuals: page.visuals.map(v => ({
+        id: v.id,
+        visualType: v.visualType,
+        title: v.title,
+        isHidden: v.isHidden,
+        position: v.position,
+        fields: {
+          category: v.fields.category,
+          values: v.fields.values,
+          legend: v.fields.legend,
+          rows: v.fields.rows,
+          columns: v.fields.columns,
+          tooltips: v.fields.tooltips,
+        },
+        // Show which fields are measures vs physical columns
+        fieldAnalysis: {
+          measureFields: [
+            ...v.fields.category,
+            ...v.fields.values,
+            ...v.fields.legend,
+          ].filter(f => f && (
+            f.startsWith('_Measures.') ||
+            f.startsWith('_measures.') ||
+            f.startsWith('Measures.')
+          )).map(f => f.split('.').slice(1).join('.')),
 
-    if (pageResult.pageId) {
-      results.step3_pageCreation = {
-        status: 'success',
-        detail: `Page created! ID: ${pageResult.pageId} | URL: ${pageResult.pageUrl}`,
-        pageId: pageResult.pageId,
-        pageUrl: pageResult.pageUrl,
-      };
+          physicalFields: [
+            ...v.fields.category,
+            ...v.fields.values,
+            ...v.fields.legend,
+          ].filter(f => f && !(
+            f.startsWith('_Measures.') ||
+            f.startsWith('_measures.') ||
+            f.startsWith('Measures.')
+          ) && !f.includes('Date Hierarchy') && !f.includes('.Variation.')),
 
-      // Also try adding the card to the page
-      const cardId = results.step2_cardCreation.cardId;
-      if (cardId) {
-        try {
-          await addCardsToPage(domain, token, pageResult.pageId, [cardId]);
-          results.step3_pageCreation.detail += ' | Card added to page successfully';
-        } catch (addErr) {
-          results.step3_pageCreation.detail += ` | Warning: Could not add card to page: ${addErr.message}`;
-        }
+          dateHierarchyFields: [
+            ...v.fields.category,
+            ...v.fields.values,
+          ].filter(f => f && (
+            f.includes('Date Hierarchy') ||
+            f.includes('.Variation.')
+          )),
+
+          tableNames: [...new Set([
+            ...v.fields.category,
+            ...v.fields.values,
+          ].filter(f => f && f.includes('.'))
+            .map(f => f.split('.')[0].trim()))],
+        },
+      })),
+    }));
+
+    // Summary
+    const allVisualTypes = {};
+    for (const page of pages) {
+      for (const visual of page.visuals) {
+        allVisualTypes[visual.visualType] = (allVisualTypes[visual.visualType] || 0) + 1;
       }
-    } else {
-      results.step3_pageCreation = {
-        status: 'failed',
-        detail: pageResult.error || 'Page creation returned null ID',
-      };
     }
-  } catch (err) {
-    results.step3_pageCreation = { status: 'error', detail: err.message };
-  }
 
-  // ── Final response ─────────────────────────────────────────────────────────
-  const allPassed = Object.values(results).every(r => r.status === 'success');
-  return res.status(allPassed ? 200 : 500).json({
-    overall: allPassed ? '✅ All steps passed' : '❌ Some steps failed',
-    results,
-  });
-});
-
-
-// TEMPORARY TEST — add this route to migrationRouter.js
-router.get('/test-card-creation', async (req, res) => {
-  try {
-    const { createDomoCard } = await import('../services/domoCardService.js');
-    const domain = (process.env.DOMO_CLIENT_DOMAIN || '').trim();
-    const token = (process.env.DOMO_CLIENT_TOKEN || '').trim();
-
-    const cardResult = await createDomoCard(domain, token, {
-      cardName: `Automated Test Card - ${new Date().toISOString()}`,
-      domoDatasetId: '1fa07c90-0cfe-4707-9964-6756799aef84',
-      columns: [
-        { name: 'Unique_Key', type: 'STRING' },
-        { name: 'Order_DateTime', type: 'DATETIME' },
-        { name: 'Ordered_By', type: 'STRING' },
-      ],
-      beastModeIds: [],
-      ownerId: null,
+    res.json({
+      format: layout.format,
+      totalPages: pages.length,
+      totalVisuals: pages.reduce((sum, p) => sum + p.visuals.length, 0),
+      visualTypeSummary: allVisualTypes,
+      pages: inspection,
     });
 
-    res.json(cardResult);
   } catch (err) {
     res.status(500).json({ error: err.message, stack: err.stack });
   }

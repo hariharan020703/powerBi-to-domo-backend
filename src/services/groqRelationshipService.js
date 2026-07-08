@@ -31,8 +31,23 @@ function buildLoadAction(id, name, dataSourceId, x, y) {
     type: 'LoadFromVault',
     id,
     name,
+    disabled: false,
+    removeByDefault: false,
+    notes: [],
+    settings: { preferredDatabaseEntityType: 'TEMP_VIEW' },
     dataSourceId,
-    gui: { x, y }
+    executeFlowWhenUpdated: false,
+    onlyLoadNewVersions: false,
+    recentVersionCutoffMs: 0,
+    columnSettings: {},
+    visiblePartitionColumn: '',
+    versionWindow: null,
+    previewRowLimit: 10000,
+    propagateAi: false,
+    filterGroupIds: [],
+    sourceType: 'AUTO',
+    filterPolicy: 'LEGACY',
+    gui: { id, type: 'Tile', x, y, color: null, colorSource: null },
   };
 }
 
@@ -41,37 +56,65 @@ function buildOutputAction(id, name, x, y, dependsOnId) {
     type: 'PublishToVault',
     id,
     name,
-    dataSourceName: name,
     dependsOn: [dependsOnId],
-    settings: {
-      "selectAction": name
-    },
-    gui: { x, y },
+    disabled: false,
+    removeByDefault: false,
+    notes: [],
+    settings: { preferredDatabaseEntityType: 'TEMP_VIEW' },
+    dataSource: { cloudId: null, name },
     versionChainType: 'REPLACE',
-    schemaSource: 'DATAFLOW',
-    partitioned: false,
+    partitionIdColumns: [],
+    upsertColumns: [],
+    retainPartitionExpression: '',
+    gui: { id, type: 'Tile', x, y, color: null, colorSource: null },
+    previewRowLimit: null,
   };
 }
 
-function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, step2Id) {
+function buildJoinAction(id, name, joinType, leftKey, rightKey, x, y, step1Id, step2Id, rightTableName) {
   const domoJoinType = joinType === 'LEFT' || joinType === 'LEFT OUTER' ? 'LEFT OUTER'
     : joinType === 'INNER' ? 'INNER'
       : joinType === 'FULL' || joinType === 'FULL OUTER' ? 'FULL OUTER'
         : 'LEFT OUTER';
+
+  const keys1 = Array.isArray(leftKey) ? leftKey : [leftKey];
+  const keys2 = Array.isArray(rightKey) ? rightKey : [rightKey];
+
+  // Build schemaModification2: rename right-side join keys that conflict with the left side
+  const schemaModification2 = [];
+  for (let i = 0; i < keys2.length; i++) {
+    const rk = keys2[i];
+    const lk = keys1[i] || keys1[0];
+    if (rk === lk) {
+      const prefix = rightTableName || step2Id;
+      schemaModification2.push({
+        name: rk,
+        rename: `${prefix}.${rk}`,
+        remove: false,
+      });
+    }
+  }
 
   return {
     type: 'MergeJoin',
     id,
     name,
     dependsOn: [step1Id, step2Id],
-    settings: {},
-    gui: { x, y },
+    disabled: false,
+    removeByDefault: false,
+    notes: [],
+    settings: { preferredDatabaseEntityType: 'TEMP_VIEW' },
     joinType: domoJoinType,
-    relationshipType: 'MANY_TO_MANY',
     step1: step1Id,
     step2: step2Id,
-    keys1: Array.isArray(leftKey) ? leftKey : [leftKey],
-    keys2: Array.isArray(rightKey) ? rightKey : [rightKey],
+    keys1,
+    keys2,
+    on: null,
+    schemaModification1: [],
+    schemaModification2,
+    relationshipType: 'MTM',
+    gui: { id, type: 'Tile', x, y, color: null, colorSource: null },
+    previewRowLimit: null,
   };
 }
 
@@ -407,7 +450,8 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
           jx,
           jy,
           leftTileId,
-          step2Id
+          step2Id,
+          rightTable
         )
       );
 
@@ -516,12 +560,12 @@ export async function createModelViewMagicEtl(reportName, resolvedRels, tableToD
       }
 
       // Run and poll the dataflow
-      // console.log(`[MAGIC ETL MODEL VIEW] Running and polling dataflow ${dataflowId}...`);
-      // const { executionId } = await runMagicEtlDataflow(dataflowId);
-      // const execResult = await pollEtlExecution(dataflowId, executionId);
-      // if (!execResult.succeeded) {
-      //   throw new Error(`Model View ETL execution failed: ${execResult.error}`);
-      // }
+      console.log(`[MAGIC ETL MODEL VIEW] Running and polling dataflow ${dataflowId}...`);
+      const { executionId } = await runMagicEtlDataflow(dataflowId);
+      const execResult = await pollEtlExecution(dataflowId, executionId);
+      if (!execResult.succeeded) {
+        throw new Error(`Model View ETL execution failed: ${execResult.error}`);
+      }
 
       // Fetch details to extract outputDatasetId
       const detailUrl = `https://${domain}/api/dataprocessing/v1/dataflows/${dataflowId}`;

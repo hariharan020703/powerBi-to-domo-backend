@@ -5,31 +5,32 @@ import {
   getReports,
   getDashboards,
   getDashboardTiles,
-  executeQuery
+  executeQuery,
+  getPowerQueryExpressions
 } from '../services/powerbiService.js';
 
 const router = Router();
 
 /**
- * Utility helper to wrap async route handlers and forward exceptions to Express error handler.
- */
+* Utility helper to wrap async route handlers and forward exceptions to Express error handler.
+*/
 const asyncHandler = (fn) => (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch(next);
 };
 
 /**
- * GET /api/powerbi/workspaces
- * Fetches workspaces (groups) for the authenticated credentials.
- */
+* GET /api/powerbi/workspaces
+* Fetches workspaces (groups) for the authenticated credentials.
+*/
 router.get('/workspaces', asyncHandler(async (req, res) => {
   const workspaces = await getWorkspaces();
   res.status(200).json(workspaces);
 }));
 
 /**
- * GET /api/powerbi/workspaces/:groupId/datasets
- * Fetches the list of datasets inside the given workspace.
- */
+* GET /api/powerbi/workspaces/:groupId/datasets
+* Fetches the list of datasets inside the given workspace.
+*/
 router.get('/workspaces/:groupId/datasets', asyncHandler(async (req, res) => {
   const { groupId } = req.params;
   const datasets = await getDatasets(groupId);
@@ -37,9 +38,9 @@ router.get('/workspaces/:groupId/datasets', asyncHandler(async (req, res) => {
 }));
 
 /**
- * GET /api/powerbi/workspaces/:groupId/reports
- * Fetches the list of reports inside the given workspace.
- */
+* GET /api/powerbi/workspaces/:groupId/reports
+* Fetches the list of reports inside the given workspace.
+*/
 router.get('/workspaces/:groupId/reports', asyncHandler(async (req, res) => {
   const { groupId } = req.params;
   const reports = await getReports(groupId);
@@ -47,9 +48,9 @@ router.get('/workspaces/:groupId/reports', asyncHandler(async (req, res) => {
 }));
 
 /**
- * GET /api/powerbi/workspaces/:groupId/dashboards
- * Fetches the list of dashboards inside the given workspace.
- */
+* GET /api/powerbi/workspaces/:groupId/dashboards
+* Fetches the list of dashboards inside the given workspace.
+*/
 router.get('/workspaces/:groupId/dashboards', asyncHandler(async (req, res) => {
   const { groupId } = req.params;
   const dashboards = await getDashboards(groupId);
@@ -57,21 +58,30 @@ router.get('/workspaces/:groupId/dashboards', asyncHandler(async (req, res) => {
 }));
 
 /**
- * GET /api/powerbi/workspaces/:groupId/dashboards/:dashboardId/tiles
- * Fetches the list of tiles inside the given dashboard.
- */
+* GET /api/powerbi/workspaces/:groupId/dashboards/:dashboardId/tiles
+* Fetches the list of tiles inside the given dashboard.
+*/
 router.get('/workspaces/:groupId/dashboards/:dashboardId/tiles', asyncHandler(async (req, res) => {
   const { groupId, dashboardId } = req.params;
   const tiles = await getDashboardTiles(groupId, dashboardId);
   res.status(200).json(tiles);
 }));
 
+/**
+* GET /api/powerbi/workspaces/:groupId/datasets/:datasetId/powerquery
+* Fetches Power Query M expressions for the dataset using the Workspace Scanner API.
+*/
+router.get('/workspaces/:groupId/datasets/:datasetId/powerquery', asyncHandler(async (req, res) => {
+  const { groupId, datasetId } = req.params;
+  const expressions = await getPowerQueryExpressions(groupId, datasetId);
+  res.status(200).json(expressions);
+}));
 
 /**
- * POST /api/powerbi/datasets/:datasetId/query
- * Executes a DAX query on a dataset.
- * Accepts body structure: { "query": "EVALUATE 'TableName'", "serializerSettings": { "includeNulls": true } }
- */
+* POST /api/powerbi/datasets/:datasetId/query
+* Executes a DAX query on a dataset.
+* Accepts body structure: { "query": "EVALUATE 'TableName'", "serializerSettings": { "includeNulls": true } }
+*/
 router.post('/datasets/:datasetId/query', asyncHandler(async (req, res) => {
   const { datasetId } = req.params;
   const { query, serializerSettings } = req.body;
@@ -80,3 +90,4 @@ router.post('/datasets/:datasetId/query', asyncHandler(async (req, res) => {
 }));
 
 export default router;
+ 
