@@ -768,15 +768,16 @@ function mapCardinalityToJoinConfig(fromCardinality, toCardinality) {
     return { relationshipType: 'OTO', joinType: 'INNER' };
   }
   if (from === 'one' && to === 'many') {
-    // fromTable is the "1" side — preserve all its rows
     return { relationshipType: 'OTM', joinType: 'LEFT OUTER' };
   }
   if (from === 'many' && to === 'one') {
-    // fromTable is the "many" side — each row should match exactly one
-    return { relationshipType: 'MTO', joinType: 'INNER' };
+    return { relationshipType: 'MTO', joinType: 'LEFT OUTER' };
   }
-  // many-to-many, or unknown/unspecified cardinality
-  return { relationshipType: 'MTM', joinType: 'INNER' };
+  if (from === 'many' && to === 'many') {
+    return { relationshipType: 'MTM', joinType: 'FULL OUTER' };
+  }
+  // fallback for many-to-many, or unknown/unspecified cardinality
+  return { relationshipType: 'MTM', joinType: 'FULL OUTER' };
 }
 
 export async function createModelViewMagicEtl(reportName, resolvedRels, tableToDatasetId) {

@@ -211,9 +211,9 @@ const VISUAL_TYPE_MAP = {
   matrix: { domoChartType: 'badge_basic_table', skip: false },
 
   // KPI / Card / Gauge
-  card: { domoChartType: 'badge_singlevalue', skip: false },
+  card: { domoChartType: 'badge_single_value', skip: false },
   multiRowCard: { domoChartType: 'badge_basic_table', skip: false },
-  kpi: { domoChartType: 'badge_singlevalue', skip: false },
+  kpi: { domoChartType: 'badge_single_value', skip: false },
   gauge: { domoChartType: 'badge_filledgauge', skip: false },
 
   // Map visuals — fallback to bar since Domo map requires lat/long
@@ -311,7 +311,7 @@ export function mapPagesToDomo(pages, domoDatasetIdMap, domoMeasureIdMap, datase
 
       // 2. Define isMeasureField using the resolved dataset info
       const knownMeasureNames = new Set(
-        Object.keys(domoMeasureIdMap || {})
+        Object.keys(domoMeasureIdMap || {}).map(k => k.trim().toLowerCase())
       );
 
       const isMeasureField = (f) => {
@@ -324,7 +324,7 @@ export function mapPagesToDomo(pages, domoDatasetIdMap, domoMeasureIdMap, datase
           return true;
         }
 
-        const cleanName = cleanRawFieldName(f);
+        const cleanName = cleanRawFieldName(f).trim().toLowerCase();
         const parts = f.replace(/^['"`]|['"`]$/g, '').split('.');
         let tableName = visualTableName;
 
@@ -347,7 +347,7 @@ export function mapPagesToDomo(pages, domoDatasetIdMap, domoMeasureIdMap, datase
           }
         }
 
-        return knownMeasureNames.has(cleanName) || knownMeasureNames.has(f.trim());
+        return knownMeasureNames.has(cleanName) || knownMeasureNames.has(f.trim().toLowerCase());
       };
 
       const isDateHierarchy = (f) =>
@@ -359,10 +359,10 @@ export function mapPagesToDomo(pages, domoDatasetIdMap, domoMeasureIdMap, datase
       const resolveMeasureOrColumn = (f) => {
         if (!f) return f;
         if (isMeasureField(f)) {
-          const cleanName = cleanRawFieldName(f);
-          const beastModeId = domoMeasureIdMap?.[cleanName] || domoMeasureIdMap?.[f.trim()];
+          const cleanName = cleanRawFieldName(f).trim().toLowerCase();
+          const beastModeId = domoMeasureIdMap?.[cleanName];
           if (beastModeId) {
-            return `calculation_${beastModeId}`;
+            return String(beastModeId).startsWith('calculation_') ? beastModeId : `calculation_${beastModeId}`;
           }
           return null; // Filter out unmapped measures so they don't break card creation
         }
@@ -394,7 +394,7 @@ export function mapPagesToDomo(pages, domoDatasetIdMap, domoMeasureIdMap, datase
         .map(f => cleanRawFieldName(f));
 
       const beastModeIds = allMeasureFields
-        .map(measureName => domoMeasureIdMap?.[measureName])
+        .map(measureName => domoMeasureIdMap?.[measureName.trim().toLowerCase()])
         .filter(Boolean);
 
       const tableName = visualTableName;
@@ -511,7 +511,7 @@ function buildDomoColumns(visual, domoChartType, fallbackColumns, datasetColumnT
   const isPie = ['badge_pie', 'badge_donut'].includes(domoChartType);
   const isBubble = domoChartType === 'badge_bubble';
   const isFunnel = domoChartType === 'badge_funnel';
-  const isSingleValue = domoChartType === 'badge_singlevalue';
+  const isSingleValue = domoChartType === 'badge_single_value';
   const isGauge = domoChartType === 'badge_filledgauge';
 
   const clean = (f) => cleanRawFieldName(f);

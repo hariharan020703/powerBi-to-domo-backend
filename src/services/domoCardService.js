@@ -19,18 +19,18 @@ async function requestWithRetry(requestFn, maxRetries = 3) {
   }
 }
 
-function buildCardBody({ cardName, domoDatasetId, columns, beastModeIds, chartType }) {
+function buildCardBody({ cardName, domoDatasetId, columns, beastModeIds, beastModes, chartType, description }) {
   const cols = columns || [];
   let resolvedChartType = chartType || 'badge_vert_stackedbar';
   const isTable = resolvedChartType === 'badge_basic_table';
-  const isSingleValue = resolvedChartType === 'badge_singlevalue' || resolvedChartType === 'badge_single_value';
+  const isSingleValue = resolvedChartType === 'badge_single_value' || resolvedChartType === 'badge_single_value';
   const isGauge = resolvedChartType === 'badge_filledgauge' || resolvedChartType === 'badge_filled_gauge';
 
   if (isGauge) {
     resolvedChartType = 'badge_filledgauge';
   }
   if (isSingleValue) {
-    resolvedChartType = 'badge_singlevalue';
+    resolvedChartType = 'badge_single_value';
   }
 
   let subscriptionColumns;
@@ -239,7 +239,24 @@ function buildCardBody({ cardName, domoDatasetId, columns, beastModeIds, chartTy
   return {
     definition: {
       subscriptions,
-      formulas: { dsUpdated: [], dsDeleted: [], card: [] },
+      formulas: {
+        dsUpdated: (beastModes || [])
+          .filter(bm => bm && bm.domoFunctionId)
+          .map(bm => {
+            const id = bm.domoFunctionId;
+            const colName = id.startsWith('calculation_') ? id : `calculation_${id}`;
+            return {
+              id: colName,
+              name: bm.name,
+              formula: bm.beastModeFormula || '',
+              dataType: bm.dataType || 'DECIMAL',
+              status: 'VALID',
+              aggregated: bm.aggregated !== undefined ? bm.aggregated : true,
+            };
+          }),
+        dsDeleted: [],
+        card: []
+      },
       annotations: { new: [], modified: [], deleted: [] },
       conditionalFormats: { card: [], datasource: [] },
       controls: [],
@@ -259,7 +276,7 @@ function buildCardBody({ cardName, domoDatasetId, columns, beastModeIds, chartTy
       ...(hasNoDateRange ? { noDateRange: true } : {}),
       inputTable: false,
       title: cardName,
-      description: 'Migrated from Power BI',
+      description: description || 'Migrated from Power BI',
     },
     dataProvider: { dataSourceId: domoDatasetId },
     variables: true,
@@ -268,8 +285,8 @@ function buildCardBody({ cardName, domoDatasetId, columns, beastModeIds, chartTy
 }
 
 export async function createDomoCard(domain, token, options) {
-  const { cardName, domoDatasetId, columns, beastModeIds, ownerId } = options;
-  const cardBody = buildCardBody({ cardName, domoDatasetId, columns, beastModeIds, chartType: options.chartType });
+  const { cardName, domoDatasetId, columns, beastModeIds, beastModes, ownerId, description } = options;
+  const cardBody = buildCardBody({ cardName, domoDatasetId, columns, beastModeIds, beastModes, chartType: options.chartType, description });
   console.log(`[CARD BODY DEBUG] "${cardName}" full request body:`, JSON.stringify(cardBody));
 
   const headers = {

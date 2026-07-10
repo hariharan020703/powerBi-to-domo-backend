@@ -432,7 +432,7 @@ async function migrateMeasuresToBeastModes(measures, domoDatasetId, availableCol
       try {
         const singleResponse = await createBeastModeFunction(domain, token, ownerId, cm);
         if (enriched) {
-          enriched.domoFunctionId = singleResponse?.id || singleResponse?.functionTemplateId || null;
+          enriched.domoFunctionId = singleResponse?.legacyId || singleResponse?.id || singleResponse?.functionTemplateId || null;
           enriched.status = 'created';
           summary.created++;
         }
@@ -1364,10 +1364,18 @@ router.post('/start', async (req, res, next) => {
           : null;
         if (!canonicalTable) canonicalTable = successfulTables[0];
 
-        if (canonicalTable) {
-          targetDomoDatasetId = canonicalTable.domoDatasetId; // Always raw dataset ID!
+        if (domoDataflowResult && domoDataflowResult.outputDatasetId && domoDataflowResult.outputDatasetId !== 'failed' && domoDataflowResult.outputDatasetId !== 'undefined') {
+          targetDomoDatasetId = domoDataflowResult.outputDatasetId;
+          console.log(`[MIGRATION] Using Model View output dataset ID for Beast Modes: ${targetDomoDatasetId}`);
+        } else if (canonicalTable && canonicalTable.magicEtl && canonicalTable.magicEtl.outputDatasetId) {
+          targetDomoDatasetId = canonicalTable.magicEtl.outputDatasetId;
+          console.log(`[MIGRATION] Using Magic ETL output dataset ID for Beast Modes: ${targetDomoDatasetId}`);
+        } else if (canonicalTable) {
+          targetDomoDatasetId = canonicalTable.domoDatasetId;
           console.log(`[MIGRATION] Using raw dataset of table '${canonicalTable.tableName}' as canonical target for Beast Modes: ${targetDomoDatasetId}`);
+        }
 
+        if (targetDomoDatasetId) {
           const allColumnsSet = new Set();
           for (const t of results.filter(r => r.status === 'success')) {
             (t.rawColumns || t.columns || []).forEach(c => allColumnsSet.add(c.name));
@@ -1550,7 +1558,7 @@ router.post('/start', async (req, res, next) => {
             const domoMeasureIdMap = {};
             for (const m of migratedMeasures) {
               if (m.domoFunctionId && m.status === 'created') {
-                domoMeasureIdMap[m.name] = m.domoFunctionId;
+                domoMeasureIdMap[m.name.trim().toLowerCase()] = m.domoFunctionId;
               }
             }
 
@@ -1644,7 +1652,7 @@ router.post('/start', async (req, res, next) => {
                 let finalColumns = (card.columns || []).filter(c => c && c.column && c.column.trim() !== '');
 
                 if (finalColumns.length === 0) {
-                  const isSingleValue = card.domoChartType === 'badge_singlevalue' || card.domoChartType === 'badge_single_value';
+                  const isSingleValue = card.domoChartType === 'badge_single_value' || card.domoChartType === 'badge_single_value';
                   if (isSingleValue) {
                     console.warn(`[MIGRATION] Skipping KPI card "${cardName}" — visual has no accurate mapped columns/measures`);
                     continue;
@@ -1665,6 +1673,46 @@ router.post('/start', async (req, res, next) => {
                   }
                 }
 
+                // Build a custom detailed card description
+                const cardBeastModes = (card.beastModeIds || [])
+                  .map(id => {
+                    const m = migratedMeasures.find(m => String(m.domoFunctionId) === String(id));
+                    if (!m) return null;
+                    const formula = m.beastModeFormula || '';
+                    return {
+                      ...m,
+                      dataType: m.dataType || inferBeastModeDataType(formula),
+                      aggregated: m.aggregated !== undefined ? m.aggregated : detectAggregated(formula)
+                    };
+                  })
+                  .filter(Boolean);
+
+                let cardDescription = `Migrated from Power BI Visual Type: ${card.powerBiVisualType || 'unknown'}\n`;
+                cardDescription += `Power BI Page: ${card.page || 'unknown'}\n`;
+                cardDescription += `Domo Dataset ID: ${datasetId}\n\n`;
+
+                if (finalColumns && finalColumns.length > 0) {
+                  cardDescription += `Columns mapped to Visual:\n`;
+                  finalColumns.forEach(c => {
+                    const aggStr = c.aggregation ? ` (Aggregation: ${c.aggregation})` : '';
+                    cardDescription += `- ${c.column} [Mapping: ${c.mapping}${aggStr}]\n`;
+                  });
+                  cardDescription += `\n`;
+                }
+
+                if (cardBeastModes.length > 0) {
+                  cardDescription += `Beast Mode / DAX Formulas:\n`;
+                  cardBeastModes.forEach(m => {
+                    cardDescription += `- Name: ${m.name}\n`;
+                    if (m.daxExpression) {
+                      cardDescription += `  DAX expression: ${m.daxExpression}\n`;
+                    }
+                    if (m.beastModeFormula) {
+                      cardDescription += `  Beast Mode expression: ${m.beastModeFormula}\n`;
+                    }
+                  });
+                }
+
                 try {
                   updateStatus(reportId, {
                     ...migrations.get(reportId),
@@ -1679,9 +1727,11 @@ router.post('/start', async (req, res, next) => {
                     cardName,
                     domoDatasetId: datasetId,
                     columns: finalColumns,
-                    beastModeIds: card.beastModeIds && card.beastModeIds.length > 0 ? card.beastModeIds : beastModeIds,
+                    beastModeIds: card.beastModeIds || [],
+                    beastModes: cardBeastModes,
                     chartType: card.domoChartType,
                     ownerId: cardOwnerId,
+                    description: cardDescription,
                   });
 
                   if (cardRes.cardId) {
